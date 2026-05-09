@@ -43,7 +43,7 @@ Agents are discovered from three directories (in order):
 2. `.pi/agents/` (project-local)
 3. `agents/` (this repo's built-ins)
 
-Each agent is a `.md` file with YAML frontmatter (`name`, `description`, `tools`, `model`) and a markdown body that becomes the system prompt.
+Each agent is a `.md` file with YAML frontmatter (`name`, `description`, `tools`) and a markdown body that becomes the system prompt.
 
 ### Key Types
 

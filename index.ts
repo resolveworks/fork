@@ -91,7 +91,6 @@ interface AgentConfig {
 	name: string;
 	description: string;
 	tools?: string[];
-	model?: string;
 	prompt: string;
 }
 
