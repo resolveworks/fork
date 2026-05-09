@@ -1,8 +1,13 @@
 /**
- * subagent-tmux — Manage subagents as interactive pi sessions in tmux windows.
+ * fork — Manage subagents as interactive pi sessions in tmux windows.
  *
  * Sessions are opened in the tmux session shared by the main agent.
- * All window management (switching, cycling, jumping) is handled by tmux directly.
+ * The parent's `subagent` tool returns immediately. When the child
+ * finishes cleanly, it writes a result file the parent watches and
+ * delivers as a `fork-result` notification message that triggers a
+ * new turn. If the human takes over the child's tmux window (typing,
+ * Esc, queued message), the child reports `takenOver` and stays alive
+ * as a normal interactive pi.
  *
  * Commands:  /agents  /kill-agent
  * Tool:      subagent { agent, task }
@@ -14,7 +19,7 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 // ── tmux ────────────────────────────────────────────────────────────
@@ -35,6 +40,14 @@ function isSubagent(): boolean {
 	return !!process.env.PI_SUBAGENT;
 }
 
+// ── shared paths ────────────────────────────────────────────────────
+
+const ROOT = path.join(os.homedir(), ".pi", "agent", "extensions", "fork");
+const RESULTS_DIR = path.join(ROOT, "results");
+const TASKS_DIR = path.join(ROOT, "tasks");
+const RESULT_TYPE = "fork-result";
+const SEEN_TTL_MS = 10 * 60 * 1000;
+
 // ── state (ephemeral JSON in /tmp) ──────────────────────────────────
 
 interface AgentEntry {
@@ -42,6 +55,7 @@ interface AgentEntry {
 	name: string;
 	task: string;
 	window: string; // tmux window index
+	parentSessionId: string;
 	started: number;
 }
 
@@ -86,7 +100,7 @@ function discoverAgents(): AgentConfig[] {
 	const dirs = [
 		path.join(os.homedir(), ".pi", "agent", "agents"),
 		".pi/agents",
-		"agents",  // local repo (./agents/)
+		"agents", // local repo (./agents/)
 	];
 
 	for (const dir of dirs) {
@@ -122,31 +136,179 @@ function discoverAgents(): AgentConfig[] {
 	return agents;
 }
 
-// ── extension ───────────────────────────────────────────────────────
+// ── result-file helpers (used by both roles) ────────────────────────
 
-export default function (pi: ExtensionAPI) {
-	if (!inTmux()) {
-		pi.registerCommand("agents", {
-			description: "Subagent management (requires tmux)",
-			handler: async (_args, ctx) => {
-				ctx.ui.notify(
-					"Run pi inside tmux to use subagent-tmux.",
-					"warn",
-				);
-			},
-		});
-		return;
+interface ResultPayload {
+	id: string;
+	agent: string;
+	parentSessionId: string;
+	tmuxWindow: string;
+	success: boolean;
+	takenOver: boolean;
+	stopReason: string;
+	summary: string;
+	timestamp: number;
+}
+
+function unlinkSpawnArtifacts(id: string): void {
+	for (const p of [
+		path.join(RESULTS_DIR, `${id}.json`),
+		path.join(TASKS_DIR, `${id}.md`),
+		path.join(TASKS_DIR, `${id}.prompt.md`),
+	]) {
+		try {
+			fs.unlinkSync(p);
+		} catch {
+			/* missing is fine */
+		}
 	}
+}
+
+// ── child role ──────────────────────────────────────────────────────
+
+function setupChild(pi: ExtensionAPI): void {
+	const id = process.env.PI_SUBAGENT_ID;
+	const parentSessionId = process.env.PI_SUBAGENT_PARENT;
+	const tmuxWindow = process.env.PI_SUBAGENT_WINDOW ?? "";
+	const agent = process.env.PI_SUBAGENT_AGENT ?? "";
+	if (!id || !parentSessionId) return;
+
+	fs.mkdirSync(RESULTS_DIR, { recursive: true });
+	let delivered = false;
+
+	const writeResult = (
+		partial: Pick<ResultPayload, "success" | "takenOver" | "stopReason" | "summary">,
+	) => {
+		if (delivered) return;
+		delivered = true;
+		const payload: ResultPayload = {
+			id,
+			agent,
+			parentSessionId,
+			tmuxWindow,
+			timestamp: Date.now(),
+			...partial,
+		};
+		const tmp = path.join(RESULTS_DIR, `.${id}.tmp`);
+		const dst = path.join(RESULTS_DIR, `${id}.json`);
+		fs.writeFileSync(tmp, JSON.stringify(payload));
+		fs.renameSync(tmp, dst);
+	};
+
+	pi.on("agent_end", (event, ctx: ExtensionContext) => {
+		if (delivered) return;
+
+		const last = [...event.messages]
+			.reverse()
+			.find((m) => m.role === "assistant") as
+			| { role: "assistant"; content: any[]; stopReason?: string }
+			| undefined;
+		const stopReason = last?.stopReason ?? "unknown";
+
+		const cleanCompletion =
+			stopReason === "stop" && !ctx.hasPendingMessages();
+
+		if (cleanCompletion) {
+			const summary = (last?.content ?? [])
+				.filter((c: any) => c.type === "text")
+				.map((c: any) => c.text)
+				.join("\n");
+			writeResult({ success: true, takenOver: false, stopReason, summary });
+			ctx.shutdown();
+			return;
+		}
+
+		// Anything else (aborted, error, length, pending messages, missing
+		// last message, unknown stopReason) → human took over OR something
+		// weird happened. Fail safe: tell parent, stay alive.
+		writeResult({ success: false, takenOver: true, stopReason, summary: "" });
+		// No ctx.shutdown(): child stays alive as interactive pi.
+	});
+}
+
+// ── parent role ─────────────────────────────────────────────────────
+
+function setupParent(pi: ExtensionAPI): void {
+	fs.mkdirSync(RESULTS_DIR, { recursive: true });
+	fs.mkdirSync(TASKS_DIR, { recursive: true });
 
 	const session = tmux("display-message -p '#S'");
 
-	// Subagent instances need no further setup.
-	if (isSubagent()) return;
-
-	// ── main instance only from here ──
-
 	let agents = pruneStale(session, loadAgents(session));
 	saveAgents(session, agents);
+
+	// ── result watcher (single instance across reloads via globalThis) ──
+
+	const seen = ((globalThis as any).__fork_seen ??= new Map<string, number>());
+	let currentSessionId: string | null = null;
+
+	const tryDeliver = (file: string) => {
+		if (!file.endsWith(".json") || file.startsWith(".")) return;
+		const full = path.join(RESULTS_DIR, file);
+		if (!fs.existsSync(full)) return;
+
+		let data: ResultPayload;
+		try {
+			data = JSON.parse(fs.readFileSync(full, "utf-8"));
+		} catch {
+			return;
+		}
+		if (!data?.id) return;
+
+		// Wrong session (or session_start hasn't fired yet): leave it for
+		// the right session to pick up later via primeExisting().
+		if (!currentSessionId || data.parentSessionId !== currentSessionId) return;
+
+		// Dedupe with TTL.
+		const now = Date.now();
+		for (const [k, t] of seen) if (now - t > SEEN_TTL_MS) seen.delete(k);
+		if (seen.has(data.id)) {
+			unlinkSpawnArtifacts(data.id);
+			return;
+		}
+		seen.set(data.id, now);
+
+		const content = data.takenOver
+			? `Subagent **${data.agent}** (window ${data.tmuxWindow}) was taken over — no findings returned. (stopReason: ${data.stopReason})`
+			: `Subagent **${data.agent}** completed:\n\n${data.summary || "(no output)"}`;
+
+		pi.sendMessage(
+			{ customType: RESULT_TYPE, content, display: true, details: data },
+			{ triggerTurn: true },
+		);
+
+		// Drop the spawn record from /tmp state too.
+		agents = loadAgents(session).filter((a) => a.id !== data.id);
+		saveAgents(session, agents);
+
+		unlinkSpawnArtifacts(data.id);
+	};
+
+	const primeExisting = () => {
+		try {
+			for (const f of fs.readdirSync(RESULTS_DIR)) tryDeliver(f);
+		} catch {
+			/* dir missing on first run is fine */
+		}
+	};
+
+	const prevUnsub = (globalThis as any).__fork_unwatch;
+	if (typeof prevUnsub === "function") {
+		try {
+			prevUnsub();
+		} catch {
+			/* ignore */
+		}
+	}
+	const watcher = fs.watch(RESULTS_DIR, (_event, name) => {
+		if (name) tryDeliver(name);
+	});
+	(globalThis as any).__fork_unwatch = () => watcher.close();
+
+	pi.on("session_start", (_event, ctx) => {
+		currentSessionId = ctx.sessionManager.getSessionId();
+		primeExisting();
+	});
 
 	// ── tool ──
 
@@ -155,7 +317,9 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description:
 			"Spawn a subagent as a separate interactive pi session in a new tmux window. " +
-			"Each subagent has an isolated context and runs autonomously. " +
+			"Returns immediately. Findings are delivered to this session as a follow-up " +
+			"message when the subagent finishes. If the user takes over the subagent's " +
+			"tmux window (typing, Esc, queued message), no findings are returned. " +
 			"Use /agents to list, /kill-agent <name> to stop.",
 		parameters: Type.Object({
 			agent: Type.String({
@@ -169,13 +333,12 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const allAgents = discoverAgents();
-			const agent = allAgents.find((a) => a.name === params.agent);
+			const cfg = allAgents.find((a) => a.name === params.agent);
 
-			if (!agent) {
+			if (!cfg) {
 				const list =
-					allAgents
-						.map((a) => `  ${a.name}: ${a.description}`)
-						.join("\n") || "  (none found)";
+					allAgents.map((a) => `  ${a.name}: ${a.description}`).join("\n") ||
+					"  (none found)";
 				return {
 					content: [
 						{
@@ -187,15 +350,12 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// Write system prompt and task to temp files (avoids shell escaping issues via tmux send-keys)
-			const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sub-"));
-			const promptPath = path.join(tmpDir, `${agent.name}.md`);
-			fs.writeFileSync(promptPath, agent.prompt, { mode: 0o600 });
-			const taskPath = path.join(tmpDir, "task.md");
+			const id = `pi-${cfg.name}-${Date.now().toString(36)}`;
+			const taskPath = path.join(TASKS_DIR, `${id}.md`);
+			const promptPath = path.join(TASKS_DIR, `${id}.prompt.md`);
 			fs.writeFileSync(taskPath, params.task, { mode: 0o600 });
+			fs.writeFileSync(promptPath, cfg.prompt, { mode: 0o600 });
 
-			// Create tmux window
-			const id = `pi-${agent.name}-${Date.now().toString(36)}`;
 			const win = tmux(
 				`new-window -t ${session} -n ${id} -c ${ctx.cwd} -P -F '#I'`,
 			);
@@ -205,23 +365,29 @@ export default function (pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
+			tmux(`set-option -t ${session}:${win} -w remain-on-exit off`);
 
-			// Build and send pi command
-			const cmd = ["PI_SUBAGENT=1", "pi"];
-			cmd.push("--append-system-prompt", promptPath);
-			if (agent.tools?.length) cmd.push("--tools", agent.tools.join(","));
+			const env = [
+				`PI_SUBAGENT=1`,
+				`PI_SUBAGENT_ID=${id}`,
+				`PI_SUBAGENT_AGENT=${cfg.name}`,
+				`PI_SUBAGENT_PARENT=${currentSessionId ?? ""}`,
+				`PI_SUBAGENT_WINDOW=${win}`,
+			].join(" ");
+			const cmd = [env, "pi", "--append-system-prompt", promptPath];
+			if (cfg.tools?.length) cmd.push("--tools", cfg.tools.join(","));
 			cmd.push(`@${taskPath}`);
 			tmux(
 				`send-keys -t ${session}:${win} ${JSON.stringify(cmd.join(" "))} Enter`,
 			);
 
-			// Track
 			agents = loadAgents(session);
 			agents.push({
 				id,
-				name: agent.name,
+				name: cfg.name,
 				task: params.task,
 				window: win,
+				parentSessionId: currentSessionId ?? "",
 				started: Date.now(),
 			});
 			saveAgents(session, agents);
@@ -230,7 +396,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Spawned ${agent.name} (window ${win}). Use tmux to switch to it.`,
+						text: `Spawned ${cfg.name} in tmux window ${win}. Findings will be delivered as a notification when done.`,
 					},
 				],
 			};
@@ -262,9 +428,7 @@ export default function (pi: ExtensionAPI) {
 
 			let target: AgentEntry | undefined;
 			if (args) {
-				target = agents.find(
-					(a) => a.name === args || a.id === args,
-				);
+				target = agents.find((a) => a.name === args || a.id === args);
 			} else if (agents.length > 0) {
 				const choices = agents.map(
 					(a) => `${a.name} (win ${a.window}): ${a.task.slice(0, 40)}`,
@@ -283,9 +447,32 @@ export default function (pi: ExtensionAPI) {
 			} catch {
 				/* already gone */
 			}
+			// Remove any pending result file so the parent doesn't get a phantom
+			// notification later.
+			unlinkSpawnArtifacts(target.id);
 			agents = agents.filter((a) => a.id !== target!.id);
 			saveAgents(session, agents);
 			ctx.ui.notify(`Killed ${target.name}`, "info");
 		},
 	});
+}
+
+// ── extension entry ─────────────────────────────────────────────────
+
+export default function (pi: ExtensionAPI) {
+	if (!inTmux()) {
+		pi.registerCommand("agents", {
+			description: "Subagent management (requires tmux)",
+			handler: async (_args, ctx) => {
+				ctx.ui.notify("Run pi inside tmux to use fork.", "warn");
+			},
+		});
+		return;
+	}
+
+	if (isSubagent()) {
+		setupChild(pi);
+		return;
+	}
+	setupParent(pi);
 }
