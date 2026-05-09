@@ -1,10 +1,10 @@
 /**
  * subagent-tmux — Manage subagents as interactive pi sessions in tmux windows.
  *
- * Everything visible lives in pi's TUI. tmux is invisible plumbing.
+ * Sessions are opened in the tmux session shared by the main agent.
+ * All window management (switching, cycling, jumping) is handled by tmux directly.
  *
- * Commands:  /agents  /switch  /kill-agent  /goto
- * Keys:      Ctrl+Shift+←/→ cycle windows, Alt+1-9 jump to window
+ * Commands:  /agents  /kill-agent
  * Tool:      subagent { agent, task }
  *
  * Requires: run pi inside tmux.
@@ -122,30 +122,6 @@ function discoverAgents(): AgentConfig[] {
 	return agents;
 }
 
-// ── widget rendering ────────────────────────────────────────────────
-
-function renderWidget(
-	agents: AgentEntry[],
-	current: string,
-	main: string,
-): string[] {
-	if (agents.length === 0) return [];
-
-	const parts: string[] = [];
-	parts.push(current === main ? "▸main" : " main");
-	for (const a of agents) {
-		const icon = current === a.window ? "▸" : " ";
-		const short =
-			a.task.length > 25 ? a.task.slice(0, 22) + "…" : a.task;
-		parts.push(`${icon}${a.name}: ${short}`);
-	}
-
-	return [
-		`Agents: ${parts.join("  │ ")}`,
-		"Ctrl+Shift+←/→ switch · Alt+1-9 jump · /switch · /kill-agent",
-	];
-}
-
 // ── extension ───────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -164,64 +140,13 @@ export default function (pi: ExtensionAPI) {
 
 	const session = tmux("display-message -p '#S'");
 
-	// ── keybindings (registered in ALL instances, main + subagent) ──
-
-	pi.registerShortcut("ctrl+shift+left", {
-		description: "Previous tmux window",
-		handler: async () => {
-			tmux("select-window -t :-");
-		},
-	});
-
-	pi.registerShortcut("ctrl+shift+right", {
-		description: "Next tmux window",
-		handler: async () => {
-			tmux("select-window -t :+");
-		},
-	});
-
-	for (let i = 1; i <= 9; i++) {
-		pi.registerShortcut(`alt+${i}`, {
-			description: `Go to window ${i}`,
-			handler: async () => {
-				tmux(`select-window -t :${i}`);
-			},
-		});
-	}
-
-	// Subagent instances get keybindings but nothing else.
+	// Subagent instances need no further setup.
 	if (isSubagent()) return;
 
 	// ── main instance only from here ──
 
-	const mainWindow = tmux("display-message -p '#I'");
 	let agents = pruneStale(session, loadAgents(session));
 	saveAgents(session, agents);
-
-	// Cached ctx for widget updates.
-	let ctx: any = null;
-
-	function refreshWidget() {
-		if (!ctx) return;
-		agents = pruneStale(session, loadAgents(session));
-		saveAgents(session, agents);
-		ctx.ui.setWidget(
-			"agents",
-			agents.length > 0
-				? renderWidget(agents, tmux("display-message -p '#I'"), mainWindow)
-				: undefined,
-			{ placement: "belowEditor" },
-		);
-	}
-
-	// ── events ──
-
-	pi.on("session_start", async (_e, c) => {
-		ctx = c;
-		refreshWidget();
-	});
-	pi.on("turn_end", async () => refreshWidget());
-	pi.on("tool_execution_end", async () => refreshWidget());
 
 	// ── tool ──
 
@@ -231,7 +156,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Spawn a subagent as a separate interactive pi session in a new tmux window. " +
 			"Each subagent has an isolated context and runs autonomously. " +
-			"Use /agents to list, /switch <name> to view, /kill-agent <name> to stop.",
+			"Use /agents to list, /kill-agent <name> to stop.",
 		parameters: Type.Object({
 			agent: Type.String({
 				description:
@@ -300,13 +225,12 @@ export default function (pi: ExtensionAPI) {
 				started: Date.now(),
 			});
 			saveAgents(session, agents);
-			refreshWidget();
 
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Spawned ${agent.name} (window ${win}). Use /switch ${agent.name} or Ctrl+Shift+Right to view.`,
+						text: `Spawned ${agent.name} (window ${win}). Use tmux to switch to it.`,
 					},
 				],
 			};
@@ -328,41 +252,6 @@ export default function (pi: ExtensionAPI) {
 				(a) => `  ${a.name} (win ${a.window}): ${a.task.slice(0, 60)}`,
 			);
 			ctx.ui.notify(`Subagents:\n${lines.join("\n")}`, "info");
-		},
-	});
-
-	pi.registerCommand("switch", {
-		description: "Switch to an agent ('main' or agent name)",
-		handler: async (args, ctx) => {
-			agents = pruneStale(session, loadAgents(session));
-			saveAgents(session, agents);
-
-			if (!args) {
-				const choices = [
-					`main (window ${mainWindow})`,
-					...agents.map(
-						(a) =>
-							`${a.name} (win ${a.window}): ${a.task.slice(0, 40)}`,
-					),
-				];
-				const pick = await ctx.ui.select("Switch to:", choices);
-				if (!pick) return;
-				const idx = choices.indexOf(pick);
-				tmux(
-					`select-window -t ${session}:${idx === 0 ? mainWindow : agents[idx - 1].window}`,
-				);
-				return;
-			}
-
-			if (args === "main") {
-				tmux(`select-window -t ${session}:${mainWindow}`);
-			} else {
-				const a = agents.find(
-					(a) => a.name === args || a.id === args,
-				);
-				if (a) tmux(`select-window -t ${session}:${a.window}`);
-				else ctx.ui.notify(`Unknown agent: ${args}`, "error");
-			}
 		},
 	});
 
@@ -396,15 +285,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			agents = agents.filter((a) => a.id !== target!.id);
 			saveAgents(session, agents);
-			refreshWidget();
 			ctx.ui.notify(`Killed ${target.name}`, "info");
-		},
-	});
-
-	pi.registerCommand("goto", {
-		description: "Go to main window",
-		handler: async () => {
-			tmux(`select-window -t ${session}:${mainWindow}`);
 		},
 	});
 }

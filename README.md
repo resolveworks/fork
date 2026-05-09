@@ -1,6 +1,8 @@
 # fork
 
-A [pi](https://github.com/earendil-works/pi) extension for managing subagents as separate interactive pi sessions in tmux windows. Everything lives in pi's TUI — tmux is invisible plumbing.
+A [pi](https://github.com/earendil-works/pi) extension for managing subagents as separate interactive pi sessions in tmux windows.
+
+Sessions are opened in the tmux session shared by the main agent. All window management (switching, cycling, jumping) is handled by tmux directly.
 
 ## Requirements
 
@@ -23,30 +25,14 @@ pi -e git:github.com/johan/fork
 
 When the LLM calls the `subagent` tool, fork spawns a new tmux window running a full interactive pi session with the agent's own system prompt, model, and tools. Each subagent has an isolated context window.
 
-A widget below the editor shows all running agents:
-
-```
-Agents: ▸main │ ⏳scout: find auth code │  worker: implement cache
-Alt+←/→ switch · Alt+1-9 jump · /switch · /kill-agent
-```
-
-## Keybindings
-
-| Key | Action |
-|-----|--------|
-| `Alt+←` / `Alt+→` | Cycle through tmux windows |
-| `Alt+1` – `Alt+9` | Jump to window by number |
-
-Work from both the main and subagent windows.
+Use tmux keybindings (`Ctrl+B n/p/1-9`, etc.) to navigate between windows.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `/agents` | List running subagents |
-| `/switch` | Picker to switch (`/switch scout` for direct) |
 | `/kill-agent` | Picker to kill (`/kill-agent scout` for direct) |
-| `/goto` | Jump back to main window |
 
 ## Agents
 
