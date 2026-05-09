@@ -176,6 +176,11 @@ function setupChild(pi: ExtensionAPI): void {
 	fs.mkdirSync(RESULTS_DIR, { recursive: true });
 	let delivered = false;
 
+	// Allow a new result after the user steers the agent following an abort.
+	pi.on("agent_start", () => {
+		delivered = false;
+	});
+
 	const writeResult = (
 		partial: Pick<ResultPayload, "success" | "takenOver" | "stopReason" | "summary">,
 	) => {
@@ -239,7 +244,7 @@ function setupParent(pi: ExtensionAPI): void {
 
 	// ── result watcher (single instance across reloads via globalThis) ──
 
-	const seen = ((globalThis as any).__fork_seen ??= new Map<string, number>());
+	const seen = ((globalThis as any).__fork_seen ??= new Map<string, { ts: number; takenOver: boolean }>());
 	let currentSessionId: string | null = null;
 
 	const tryDeliver = (file: string) => {
@@ -259,14 +264,16 @@ function setupParent(pi: ExtensionAPI): void {
 		// the right session to pick up later via primeExisting().
 		if (!currentSessionId || data.parentSessionId !== currentSessionId) return;
 
-		// Dedupe with TTL.
+		// Dedupe with TTL.  Allow re-delivery when a takenOver result is
+		// superseded by a real one (user steered after aborting).
 		const now = Date.now();
-		for (const [k, t] of seen) if (now - t > SEEN_TTL_MS) seen.delete(k);
-		if (seen.has(data.id)) {
+		for (const [k, v] of seen) if (now - v.ts > SEEN_TTL_MS) seen.delete(k);
+		const prev = seen.get(data.id);
+		if (prev && !(prev.takenOver && !data.takenOver)) {
 			unlinkSpawnArtifacts(data.id);
 			return;
 		}
-		seen.set(data.id, now);
+		seen.set(data.id, { ts: now, takenOver: data.takenOver });
 
 		const content = data.takenOver
 			? `Subagent **${data.agent}** (window ${data.tmuxWindow}) was taken over — no findings returned. (stopReason: ${data.stopReason})`
