@@ -4,7 +4,7 @@
  * Everything visible lives in pi's TUI. tmux is invisible plumbing.
  *
  * Commands:  /agents  /switch  /kill-agent  /goto
- * Keys:      Alt+←/→ cycle windows, Alt+1-9 jump to window
+ * Keys:      Ctrl+Shift+←/→ cycle windows, Alt+1-9 jump to window
  * Tool:      subagent { agent, task }
  *
  * Requires: run pi inside tmux.
@@ -112,7 +112,6 @@ function discoverAgents(): AgentConfig[] {
 						?.split(",")
 						.map((t) => t.trim())
 						.filter(Boolean),
-					model: fm.model,
 					prompt: m[2].trim(),
 				});
 			}
@@ -143,7 +142,7 @@ function renderWidget(
 
 	return [
 		`Agents: ${parts.join("  │ ")}`,
-		"Alt+←/→ switch · Alt+1-9 jump · /switch · /kill-agent",
+		"Ctrl+Shift+←/→ switch · Alt+1-9 jump · /switch · /kill-agent",
 	];
 }
 
@@ -167,14 +166,14 @@ export default function (pi: ExtensionAPI) {
 
 	// ── keybindings (registered in ALL instances, main + subagent) ──
 
-	pi.registerShortcut("alt+left", {
+	pi.registerShortcut("ctrl+shift+left", {
 		description: "Previous tmux window",
 		handler: async () => {
 			tmux("select-window -t :-");
 		},
 	});
 
-	pi.registerShortcut("alt+right", {
+	pi.registerShortcut("ctrl+shift+right", {
 		description: "Next tmux window",
 		handler: async () => {
 			tmux("select-window -t :+");
@@ -263,10 +262,12 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// Write system prompt to temp file (pi reads it via --append-system-prompt)
+			// Write system prompt and task to temp files (avoids shell escaping issues via tmux send-keys)
 			const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sub-"));
 			const promptPath = path.join(tmpDir, `${agent.name}.md`);
 			fs.writeFileSync(promptPath, agent.prompt, { mode: 0o600 });
+			const taskPath = path.join(tmpDir, "task.md");
+			fs.writeFileSync(taskPath, params.task, { mode: 0o600 });
 
 			// Create tmux window
 			const id = `pi-${agent.name}-${Date.now().toString(36)}`;
@@ -283,9 +284,8 @@ export default function (pi: ExtensionAPI) {
 			// Build and send pi command
 			const cmd = ["PI_SUBAGENT=1", "pi"];
 			cmd.push("--append-system-prompt", promptPath);
-			if (agent.model) cmd.push("--model", agent.model);
 			if (agent.tools?.length) cmd.push("--tools", agent.tools.join(","));
-			cmd.push("-p", JSON.stringify(params.task));
+			cmd.push(`@${taskPath}`);
 			tmux(
 				`send-keys -t ${session}:${win} ${JSON.stringify(cmd.join(" "))} Enter`,
 			);
@@ -306,7 +306,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Spawned ${agent.name} (window ${win}). Use /switch ${agent.name} or Alt+Right to view.`,
+						text: `Spawned ${agent.name} (window ${win}). Use /switch ${agent.name} or Ctrl+Shift+Right to view.`,
 					},
 				],
 			};
