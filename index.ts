@@ -175,10 +175,11 @@ function setupChild(pi: ExtensionAPI): void {
 
 	fs.mkdirSync(RESULTS_DIR, { recursive: true });
 	let delivered = false;
+	let aborted = false;
 
-	// Allow a new result after the user steers the agent following an abort.
+	// Allow a new result after the user steers the agent (but not after abort).
 	pi.on("agent_start", () => {
-		delivered = false;
+		if (!aborted) delivered = false;
 	});
 
 	const writeResult = (
@@ -223,11 +224,44 @@ function setupChild(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// Anything else (aborted, error, length, pending messages, missing
-		// last message, unknown stopReason) → human took over OR something
-		// weird happened. Fail safe: tell parent, stay alive.
+		// Steer: user sent a message while agent was running.
+		// Write takenOver result; agent_start will reset delivered
+		// so the next clean completion auto-reports.
+		if (ctx.hasPendingMessages()) {
+			writeResult({ success: false, takenOver: true, stopReason, summary: "" });
+			return;
+		}
+
+		// Abort: agent was cancelled (Esc), no pending messages.
+		// Register report() tool so the human can explicitly report back.
+		aborted = true;
 		writeResult({ success: false, takenOver: true, stopReason, summary: "" });
-		// No ctx.shutdown(): child stays alive as interactive pi.
+
+		pi.registerTool({
+			name: "report",
+			label: "Report",
+			description:
+				"Report findings back to the parent session and close this subagent window. " +
+				"Call this when the human instructs you to report back.",
+			parameters: Type.Object({
+				summary: Type.String({
+					description: "Summary of findings to report to the parent",
+				}),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, toolCtx) {
+				delivered = false; // allow writeResult to supersede the takenOver result
+				writeResult({
+					success: true,
+					takenOver: false,
+					stopReason: "report",
+					summary: params.summary,
+				});
+				toolCtx.shutdown();
+				return {
+					content: [{ type: "text", text: "Reported findings to parent session." }],
+				};
+			},
+		});
 	});
 }
 
@@ -283,6 +317,12 @@ function setupParent(pi: ExtensionAPI): void {
 			{ customType: RESULT_TYPE, content, display: true, details: data },
 			{ triggerTurn: true },
 		);
+
+		// Close the subagent's tmux window on clean completion.
+		// TakenOver windows are still in use by a human — leave them.
+		if (!data.takenOver && data.tmuxWindow) {
+			try { tmux(`kill-window -t ${session}:${data.tmuxWindow}`); } catch {}
+		}
 
 		// Drop the spawn record from /tmp state too.
 		agents = loadAgents(session).filter((a) => a.id !== data.id);
@@ -382,7 +422,8 @@ function setupParent(pi: ExtensionAPI): void {
 				`PI_SUBAGENT_WINDOW=${win}`,
 			].join(" ");
 			const cmd = [env, "pi", "--append-system-prompt", promptPath];
-			if (cfg.tools?.length) cmd.push("--tools", cfg.tools.join(","));
+			if (cfg.tools?.length)
+				cmd.push("--tools", [...cfg.tools, "report"].join(","));
 			cmd.push(`@${taskPath}`);
 			tmux(
 				`send-keys -t ${session}:${win} ${JSON.stringify(cmd.join(" "))} Enter`,
