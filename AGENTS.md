@@ -37,10 +37,10 @@ If you're adding error handling: ask yourself whether the error represents a pro
 
 The extension entry point (`export default function`) checks the environment and branches:
 
-- **Parent role** (`setupParent`): Registers the `subagent` tool and watches for result files from children.
-- **Child role** (`setupChild`): Listens for `agent_end` events and writes a JSON result file that the parent picks up.
+- **Parent role** (`setupParent`): Registers one tool per agent and listens on a per-session Unix domain socket for result messages from children.
+- **Child role** (`setupChild`): Listens for `agent_end` events and sends a JSON result line over the socket address it was given at spawn.
 
-Communication is file-based: children write to `~/.pi/agent/extensions/fork/results/<id>.json`, parents watch that directory with `fs.watch`.
+Communication is socket-based: each parent listens on `~/.pi/agent/extensions/fork/sockets/<parentSessionId>.sock` (mode 0o600). Children connect, write one newline-delimited JSON `ResultPayload`, and close. Per-parent socket scoping replaces the previous shared results directory.
 
 ### Agents
 
@@ -54,26 +54,26 @@ This keeps the interplay between them tightly controlled and easy to iterate on.
 
 ### Key Types
 
-- `AgentConfig` — hardcoded agent definition (name, description, tools, prompt)
-- `ResultPayload` — JSON written by child on completion (success, takenOver, summary)
+- `SubAgent<P, R>` — base class for an agent definition (name, description, tools, system prompt, task formatter, result extractor)
+- `ResultPayload` — JSON sent by child on completion or takeover (id, agent, tmuxWindow, success, takenOver, stopReason, summary, timestamp)
 
 ### Lifecycle
 
-1. LLM calls `subagent` tool → parent writes task file, creates tmux window, sends `pi` command with `--append-system-prompt` and `--tools`
-2. Child runs in isolated pi session with `PI_SUBAGENT=1` env vars
-3. On `agent_end`: if clean completion (`stopReason === "stop"` + no pending messages), child writes success result and shuts down. Otherwise writes `takenOver: true` and stays alive as interactive pi.
-4. Parent's `fs.watch` picks up result file → delivers `fork-result` notification → triggers new parent turn
-5. Clean completions automatically close the subagent's tmux window
+1. LLM calls an agent's tool → parent writes the task file, creates a tmux window, and `send-keys` a `pi --agent <name> --subagent-id <id> --subagent-socket <path> --subagent-window <win> @<taskPath>` command into it
+2. Child starts in an isolated pi session, applies the agent's system prompt via `before_agent_start`, and reads the task from the task file
+3. On `agent_end`: if clean completion (`stopReason === "stop"` + no pending messages), child sends a success `ResultPayload` over the socket and shuts down. If the human interrupted, child sends `takenOver: true` and stays alive as an interactive pi (with a `report` tool if the run was aborted).
+4. Parent's socket connection handler parses the JSON line and delivers a `fork-result` notification → triggers a new parent turn
+5. Clean completions automatically close the subagent's tmux window and remove its task file
 
 ### Reload Safety
 
-The extension uses `globalThis` to persist the `fs.watch` handle and deduplication map across hot reloads within the same pi session.
+The extension uses `globalThis.__fork_server` (and the matching `__fork_server_path`) to remember the listening socket across hot reloads within the same pi process. On reload, the previous server is closed and its socket file unlinked before the new one starts listening. Cleanup is for *known* prior state we placed there — stale sockets from a crashed prior process are not preemptively removed; `listen` will throw `EADDRINUSE` and the user clears the file.
 
 ## Shared Paths
 
 All runtime state lives under `~/.pi/agent/extensions/fork/`:
-- `results/` — JSON result files (child → parent communication)
-- `tasks/` — task prompts and system prompts for spawned agents
+- `sockets/` — per-parent Unix domain sockets (`<parentSessionId>.sock`, mode 0o600)
+- `tasks/` — task message files handed to children at spawn (mode 0o600)
 
 ## Conventions
 
@@ -88,7 +88,7 @@ All runtime state lives under `~/.pi/agent/extensions/fork/`:
 
 - To modify an agent: edit its entry in the `AGENTS` array in `index.ts`.
 - To modify tool behavior: edit the `execute` callback in `setupParent`'s `registerTool` call.
-- To change result delivery: edit `tryDeliver` in `setupParent` or `writeResult` in `setupChild`.
+- To change result delivery: edit `Dispatcher.deliverResult` (parent) or `sendResult` in `setupChild` (child).
 
 
 ## Install & Run

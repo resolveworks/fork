@@ -16,6 +16,7 @@
 
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -38,17 +39,19 @@ function inTmux(): boolean {
 // ── shared paths / constants ────────────────────────────────────────
 
 const ROOT = path.join(os.homedir(), ".pi", "agent", "extensions", "fork");
-const RESULTS_DIR = path.join(ROOT, "results");
+const SOCKETS_DIR = path.join(ROOT, "sockets");
 const TASKS_DIR = path.join(ROOT, "tasks");
 const RESULT_TYPE = "fork-result";
-const SEEN_TTL_MS = 10 * 60 * 1000;
 
-// ── result payload (written by child, read by parent) ───────────────
+function socketPathFor(parentSessionId: string): string {
+	return path.join(SOCKETS_DIR, `${parentSessionId}.sock`);
+}
+
+// ── result payload (sent by child over socket, parsed by parent) ────
 
 interface ResultPayload {
 	id: string;
 	agent: string;
-	parentSessionId: string;
 	tmuxWindow: string;
 	success: boolean;
 	takenOver: boolean;
@@ -62,19 +65,6 @@ interface ChildCompletion {
 	takenOver: boolean;
 	stopReason: string;
 	summary: string;
-}
-
-function unlinkSpawnArtifacts(id: string): void {
-	for (const p of [
-		path.join(RESULTS_DIR, `${id}.json`),
-		path.join(TASKS_DIR, `${id}.md`),
-	]) {
-		try {
-			fs.unlinkSync(p);
-		} catch {
-			/* missing is fine */
-		}
-	}
 }
 
 // ── SubAgent base ───────────────────────────────────────────────────
@@ -331,13 +321,12 @@ const agentByName = new Map(agents.map((a) => [a.name, a]));
 
 class Dispatcher {
 	private active = new Map<string, { agent: SubAgent<any, any>; params: any }>();
-	private seen: Map<string, { ts: number; takenOver: boolean }>;
+	private finalized = new Set<string>();
 	private session: string;
 	private currentSessionId: string | null = null;
 
 	constructor(private pi: ExtensionAPI) {
 		this.session = tmux("display-message -p '#S'");
-		this.seen = ((globalThis as any).__fork_seen ??= new Map());
 	}
 
 	setSessionId(id: string): void {
@@ -349,6 +338,11 @@ class Dispatcher {
 		params: P,
 		ctx: { cwd: string },
 	): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
+		if (!this.currentSessionId) {
+			throw new Error(
+				"fork: spawn called before session_start; no session id available",
+			);
+		}
 		const id = `pi-${agent.name}-${Date.now().toString(36)}`;
 		const taskPath = path.join(TASKS_DIR, `${id}.md`);
 		fs.writeFileSync(taskPath, agent.formatTask(params), { mode: 0o600 });
@@ -370,8 +364,8 @@ class Dispatcher {
 			agent.name,
 			"--subagent-id",
 			id,
-			"--subagent-parent",
-			this.currentSessionId ?? "",
+			"--subagent-socket",
+			socketPathFor(this.currentSessionId),
 			"--subagent-window",
 			win,
 			`@${taskPath}`,
@@ -390,35 +384,10 @@ class Dispatcher {
 		};
 	}
 
-	tryDeliver(file: string): void {
-		if (!file.endsWith(".json") || file.startsWith(".")) return;
-		const full = path.join(RESULTS_DIR, file);
-		if (!fs.existsSync(full)) return;
+	deliverResult(payload: ResultPayload): void {
+		if (this.finalized.has(payload.id)) return;
 
-		let data: ResultPayload;
-		try {
-			data = JSON.parse(fs.readFileSync(full, "utf-8"));
-		} catch {
-			return;
-		}
-		if (!data?.id) return;
-
-		// Not our session yet — leave for the right session to pick up.
-		if (!this.currentSessionId || data.parentSessionId !== this.currentSessionId)
-			return;
-
-		// Dedupe with TTL. Allow re-delivery when a takenOver is superseded.
-		const now = Date.now();
-		for (const [k, v] of this.seen)
-			if (now - v.ts > SEEN_TTL_MS) this.seen.delete(k);
-		const prev = this.seen.get(data.id);
-		if (prev && !(prev.takenOver && !data.takenOver)) {
-			unlinkSpawnArtifacts(data.id);
-			return;
-		}
-		this.seen.set(data.id, { ts: now, takenOver: data.takenOver });
-
-		const message = this.formatDelivery(data);
+		const message = this.formatDelivery(payload);
 
 		this.pi.sendMessage(
 			{
@@ -430,21 +399,12 @@ class Dispatcher {
 			{ triggerTurn: true },
 		);
 
-		if (!data.takenOver && data.tmuxWindow) {
-			try {
-				tmux(`kill-window -t ${this.session}:${data.tmuxWindow}`);
-			} catch {
-				/* ignore */
+		if (!payload.takenOver) {
+			this.finalized.add(payload.id);
+			if (payload.tmuxWindow) {
+				tmux(`kill-window -t ${this.session}:${payload.tmuxWindow}`);
 			}
-		}
-		unlinkSpawnArtifacts(data.id);
-	}
-
-	primeExisting(): void {
-		try {
-			for (const f of fs.readdirSync(RESULTS_DIR)) this.tryDeliver(f);
-		} catch {
-			/* dir missing on first run is fine */
+			fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
 		}
 	}
 
@@ -469,23 +429,15 @@ class Dispatcher {
 			};
 		}
 
-		let typed: unknown;
-		try {
-			typed = slot.agent.extractResult(
-				{
-					success: data.success,
-					takenOver: data.takenOver,
-					stopReason: data.stopReason,
-					summary: data.summary,
-				},
-				slot.params,
-			);
-		} catch (err) {
-			return {
-				content: `Subagent **${data.agent}** completed but extractResult failed: ${String(err)}\n\n${data.summary || ""}`,
-				details: data,
-			};
-		}
+		const typed = slot.agent.extractResult(
+			{
+				success: data.success,
+				takenOver: data.takenOver,
+				stopReason: data.stopReason,
+				summary: data.summary,
+			},
+			slot.params,
+		);
 
 		return {
 			content: `Subagent **${data.agent}** completed:\n\n\`\`\`json\n${JSON.stringify(typed, null, 2)}\n\`\`\``,
@@ -497,27 +449,46 @@ class Dispatcher {
 // ── parent role ─────────────────────────────────────────────────────
 
 function setupParent(pi: ExtensionAPI): void {
-	fs.mkdirSync(RESULTS_DIR, { recursive: true });
+	fs.mkdirSync(SOCKETS_DIR, { recursive: true });
 	fs.mkdirSync(TASKS_DIR, { recursive: true });
 
 	const dispatcher = new Dispatcher(pi);
 
-	const prevUnsub = (globalThis as any).__fork_unwatch;
-	if (typeof prevUnsub === "function") {
-		try {
-			prevUnsub();
-		} catch {
-			/* ignore */
-		}
-	}
-	const watcher = fs.watch(RESULTS_DIR, (_event, name) => {
-		if (name) dispatcher.tryDeliver(name);
-	});
-	(globalThis as any).__fork_unwatch = () => watcher.close();
-
 	pi.on("session_start", (_event, ctx) => {
-		dispatcher.setSessionId(ctx.sessionManager.getSessionId());
-		dispatcher.primeExisting();
+		const sessionId = ctx.sessionManager.getSessionId();
+		dispatcher.setSessionId(sessionId);
+
+		// Planned cleanup of a server left by a previous extension load in this
+		// same process (pi's hot-reload model). We don't preemptively clean
+		// sockets from other processes — `listen` will throw EADDRINUSE.
+		const prevServer = (globalThis as any).__fork_server as net.Server | undefined;
+		const prevPath = (globalThis as any).__fork_server_path as string | undefined;
+		if (prevServer) {
+			prevServer.close();
+			if (prevPath) fs.unlinkSync(prevPath);
+		}
+
+		const sockPath = socketPathFor(sessionId);
+		const server = net.createServer((socket) => {
+			let buf = "";
+			socket.setEncoding("utf-8");
+			socket.on("data", (chunk: string) => {
+				buf += chunk;
+				let nl: number;
+				while ((nl = buf.indexOf("\n")) >= 0) {
+					const line = buf.slice(0, nl);
+					buf = buf.slice(nl + 1);
+					if (line.length === 0) continue;
+					const payload = JSON.parse(line) as ResultPayload;
+					dispatcher.deliverResult(payload);
+				}
+			});
+		});
+		server.listen(sockPath, () => {
+			fs.chmodSync(sockPath, 0o600);
+		});
+		(globalThis as any).__fork_server = server;
+		(globalThis as any).__fork_server_path = sockPath;
 	});
 
 	for (const a of agents) a.registerTool(pi, dispatcher);
@@ -527,37 +498,43 @@ function setupParent(pi: ExtensionAPI): void {
 
 function setupChild(pi: ExtensionAPI, agent: SubAgent<any, any>): void {
 	const id = pi.getFlag("subagent-id") as string | undefined;
-	const parentSessionId = pi.getFlag("subagent-parent") as string | undefined;
+	const socketPath = pi.getFlag("subagent-socket") as string | undefined;
 	const tmuxWindow = (pi.getFlag("subagent-window") as string | undefined) ?? "";
-	if (!id || !parentSessionId) return;
-
-	fs.mkdirSync(RESULTS_DIR, { recursive: true });
+	if (!id) throw new Error("fork: subagent missing required --subagent-id flag");
+	if (!socketPath)
+		throw new Error("fork: subagent missing required --subagent-socket flag");
 
 	agent.setupChild(pi);
 
 	let delivered = false;
 	let aborted = false;
 
-	const writeResult = (
+	const sendResult = (
 		partial: Pick<
 			ResultPayload,
 			"success" | "takenOver" | "stopReason" | "summary"
 		>,
+		onSent?: () => void,
 	) => {
-		if (delivered) return;
+		if (delivered) {
+			onSent?.();
+			return;
+		}
 		delivered = true;
 		const payload: ResultPayload = {
 			id,
 			agent: agent.name,
-			parentSessionId,
 			tmuxWindow,
 			timestamp: Date.now(),
 			...partial,
 		};
-		const tmp = path.join(RESULTS_DIR, `.${id}.tmp`);
-		const dst = path.join(RESULTS_DIR, `${id}.json`);
-		fs.writeFileSync(tmp, JSON.stringify(payload));
-		fs.renameSync(tmp, dst);
+		const socket = net.connect(socketPath);
+		socket.on("error", (err) => {
+			throw err;
+		});
+		socket.end(`${JSON.stringify(payload)}\n`, () => {
+			onSent?.();
+		});
 	};
 
 	pi.on("agent_start", () => {
@@ -579,21 +556,23 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any, any>): void {
 				.filter((c: any) => c.type === "text")
 				.map((c: any) => c.text)
 				.join("\n");
-			writeResult({ success: true, takenOver: false, stopReason, summary });
-			ctx.shutdown();
+			sendResult(
+				{ success: true, takenOver: false, stopReason, summary },
+				() => ctx.shutdown(),
+			);
 			return;
 		}
 
 		// Steer: user typed while running. takenOver result now; agent_start
 		// will reset `delivered` so the next clean completion supersedes it.
 		if (ctx.hasPendingMessages()) {
-			writeResult({ success: false, takenOver: true, stopReason, summary: "" });
+			sendResult({ success: false, takenOver: true, stopReason, summary: "" });
 			return;
 		}
 
 		// Abort: Esc, no pending messages. Hand the human a `report()` tool.
 		aborted = true;
-		writeResult({ success: false, takenOver: true, stopReason, summary: "" });
+		sendResult({ success: false, takenOver: true, stopReason, summary: "" });
 
 		pi.registerTool({
 			name: "report",
@@ -608,11 +587,16 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any, any>): void {
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, toolCtx) {
 				delivered = false;
-				writeResult({
-					success: true,
-					takenOver: false,
-					stopReason: "report",
-					summary: (params as { summary: string }).summary,
+				await new Promise<void>((resolve) => {
+					sendResult(
+						{
+							success: true,
+							takenOver: false,
+							stopReason: "report",
+							summary: (params as { summary: string }).summary,
+						},
+						resolve,
+					);
 				});
 				toolCtx.shutdown();
 				return {
@@ -638,8 +622,8 @@ export default function (pi: ExtensionAPI) {
 		description: "Subagent id (internal)",
 		type: "string",
 	});
-	pi.registerFlag("subagent-parent", {
-		description: "Parent session id (internal)",
+	pi.registerFlag("subagent-socket", {
+		description: "Parent socket path (internal)",
 		type: "string",
 	});
 	pi.registerFlag("subagent-window", {
@@ -650,7 +634,8 @@ export default function (pi: ExtensionAPI) {
 	const agentName = pi.getFlag("agent") as string | undefined;
 	if (agentName) {
 		const agent = agentByName.get(agentName);
-		if (agent) setupChild(pi, agent);
+		if (!agent) throw new Error(`fork: unknown agent "${agentName}"`);
+		setupChild(pi, agent);
 		return;
 	}
 	setupParent(pi);
