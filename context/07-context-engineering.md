@@ -9,8 +9,6 @@ A working mental model: the context window is a stack of decreasing scope.
 ```
 ┌──────────────────────────────────┐  always loaded
 │  Project rules (AGENTS.md)       │
-├──────────────────────────────────┤  loaded for feature
-│  Feature spec (specs/<x>.md)     │
 ├──────────────────────────────────┤  loaded for plan
 │  Plan file (plans/<x>.md)        │
 ├──────────────────────────────────┤  loaded for step
@@ -19,9 +17,11 @@ A working mental model: the context window is a stack of decreasing scope.
 └──────────────────────────────────┘  ← model only acts on this
 ```
 
-The principle: each layer narrows. A subagent doing step 3 of plan X for feature Y should only see step 3, not the whole plan, not the whole feature.
+The principle: each layer narrows. A subagent doing step 3 of plan X should only see step 3, not the whole plan.
 
 For small models this isn't optional. Long context degrades output sharply.
+
+(Some workflows insert a separate feature-spec layer between project rules and plan. For most setups the plan's goal section is enough; see [02-specs-and-planning.md](./02-specs-and-planning.md).)
 
 ## AGENTS.md (the project-level layer)
 
@@ -50,17 +50,11 @@ As of April 2026, Claude Code does not natively read AGENTS.md. The common worka
 
 This repo already has an AGENTS.md, which is good practice.
 
-## Feature specs (the feature-level layer)
+## Plans (the feature/execution layer)
 
-Lives in `specs/<slug>.md` (or `.pi/specs/`, etc.). Loaded only when working on that feature. See [02-specs-and-planning.md](./02-specs-and-planning.md) for what goes in it.
+A plan turns intent into an ordered set of implementable steps. Lives in `plans/<slug>.md` (or `.pi/.../plans/`). See [02-specs-and-planning.md](./02-specs-and-planning.md) for the shape.
 
-The key property: a feature spec is **scoped**. It doesn't repeat project rules; it inherits them. It doesn't describe the whole system; it describes this change.
-
-## Plans (the execution-level layer)
-
-A plan is the spec turned into an ordered set of implementable steps. Lives in `plans/<slug>.md` or as part of the spec. See [02-specs-and-planning.md](./02-specs-and-planning.md).
-
-The plan is *the* file the implementer re-reads on each step. Project rules and spec are background; the plan is foreground.
+The plan's goal section carries the *intent*; the steps carry the *execution*. Project rules in AGENTS.md are background; the plan is foreground. The implementer reads only what it needs from the plan — usually just the current step.
 
 ## What to load per step
 
@@ -70,9 +64,7 @@ For step N of plan X:
 - **Always:** step N text — this is what to do
 - **Usually:** the file(s) named in step N — full content
 - **Sometimes:** adjacent files referenced by step N — full content if small, function signatures only if large
-- **Sometimes:** plan steps 1..N-1 in summary form — useful if state has been built up
 - **Rarely:** the full plan — usually not needed beyond the step text
-- **Rarely:** the spec — only if step N is doing something the plan can't fully describe
 
 Context budget for a small model: aim for **<8K tokens** of loaded context per step, ideally <4K. Past that, quality degrades noticeably for most local models, regardless of advertised context window.
 
@@ -112,6 +104,6 @@ It replaces prompt engineering as the primary lever. Prompt wording matters but 
 
 ## See also
 
-- [02-specs-and-planning.md](./02-specs-and-planning.md) — the artifacts that live in each context layer
+- [02-specs-and-planning.md](./02-specs-and-planning.md) — the plan file shape
 - [08-local-tooling.md](./08-local-tooling.md) — how Cline / Aider / Continue handle context loading
 - [09-applying-to-fork.md](./09-applying-to-fork.md) — context loading strategy for fork's subagents

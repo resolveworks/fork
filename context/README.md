@@ -8,15 +8,15 @@ Local models in the small-to-medium range are derpy. They lose track, hallucinat
 
 ## TL;DR
 
-The pattern that has won is **spec → plan → small chunks → verify**, with each step happening in a fresh, narrow context window. Quality comes from constraining the system, not from the model being smart.
+The pattern that has won is **plan → small chunks → verify**, with each step happening in a fresh, narrow context window. Quality comes from constraining the system, not from the model being smart.
 
 Six concrete levers in order of impact:
 
 1. **Narrow the task.** One function, one chunk, one plan step — not "implement the feature."
-2. **Externalize the plan as a file.** Plans are artifacts the human can edit and the agent re-reads, not transient prompt text.
+2. **Externalize the plan as a file.** Plans are artifacts the human can edit and the agent re-reads, not transient prompt text. Keep them read-only data; track state outside the file.
 3. **Verify with external signals.** Tests, type-checks, linters > self-critique. A 2023 result still holds: pure self-review *lowers* accuracy.
 4. **Use schemas to pin reliability.** Constrained decoding makes a 7B model emit valid JSON 99% of the time. Reliability ≠ smartness.
-5. **Engineer the context.** AGENTS.md / CLAUDE.md at the repo root. Hierarchical: project rules → spec → plan → just-the-task-at-hand.
+5. **Engineer the context.** AGENTS.md / CLAUDE.md at the repo root carries project rules. Each subagent call gets only project rules + the one step + named files.
 6. **Don't expect tool-calling miracles below 7B.** Sub-7B models effectively cannot reliably chain tool calls. Plan around it.
 
 ## Files in this knowledge base
@@ -24,7 +24,7 @@ Six concrete levers in order of impact:
 | File | Topic |
 |---|---|
 | [01-core-loop.md](./01-core-loop.md) | The proven loop end-to-end: spec → plan → chunk → verify |
-| [02-specs-and-planning.md](./02-specs-and-planning.md) | What makes a good spec; micro-specs; plan files as artifacts |
+| [02-specs-and-planning.md](./02-specs-and-planning.md) | Plan file shape; micro-plans; what to spell out for derpy models |
 | [03-agent-patterns.md](./03-agent-patterns.md) | Plan-and-Execute, ReWOO, LLMCompiler; and the mixing-models caveat |
 | [04-verification.md](./04-verification.md) | Generate → verify → revise; external signals beat self-critique |
 | [05-reliability-techniques.md](./05-reliability-techniques.md) | Constrained decoding, schemas, the reasoning trade-off |

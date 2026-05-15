@@ -1,68 +1,29 @@
-# Specs and planning
+# Planning
 
-The first two phases of the core loop ([01-core-loop.md](./01-core-loop.md)). Both produce **files**, not transient prompt text. The file-ness is the point — humans can edit them, agents re-read them, and they survive across sessions and context resets.
+The phase between "human knows what they want" and "model writes code." Its job is to produce a **plan file** — a durable artifact the implementer reads to do its work.
 
-## Specs
+This file used to split spec and plan into two artifacts. In practice, for most setups (and for fork specifically), a single plan file plus the project's `AGENTS.md` is enough. The split into spec+plan is one school's preference, not field consensus. See the end of this file for when the split actually pays off.
 
-### What goes in a spec
+## What a plan is
 
-Addy Osmani's six structural elements for AI-agent specs, refined across thousands of practitioners:
-
-1. **Commands** — Executable commands with full flags (e.g., `npm test --silent`)
-2. **Testing** — Framework details, test file locations, coverage expectations
-3. **Project structure** — Explicit directory organization
-4. **Code style** — *Real examples* demonstrating preferred conventions, not abstract rules
-5. **Git workflow** — Branch naming, commit formats, PR requirements
-6. **Boundaries** — Three-tier: "always do" / "ask first" / "never do"
-
-Plus the feature-specific content:
-- Problem statement and acceptance criteria
-- Architecture decisions (with rationale, not just "use X")
-- Data models / schemas
-- Testing strategy for *this feature*
-- Non-goals — what's explicitly out of scope
-
-### What makes specs fail
-
-"Most agent files fail because they're too vague." Concrete vs. vague:
-
-| Vague | Concrete |
-|---|---|
-| "Use modern React" | "React 18.3 with hooks; no class components; functional state via `useReducer` for forms" |
-| "Follow our style" | (paste a 20-line example from the codebase) |
-| "Handle errors properly" | "All async functions throw on failure; the top-level handler in `errors.ts` catches and reports" |
-| "Don't break anything" | "Never modify files in `legacy/`; never change public API signatures in `api/v1/`" |
-
-### Two specs, not one
-
-The pattern that works in practice:
-
-- **Project-level spec** — lives at the repo root as `AGENTS.md` or `CLAUDE.md`. Loaded into *every* session. Contains rules that apply globally: commands, structure, style, conventions, boundaries.
-- **Feature-level spec** — lives in `specs/<slug>.md` or similar. Loaded for the feature being worked on. Contains problem statement, acceptance criteria, design.
-
-The project-level spec is the answer to "what would I tell a senior engineer joining on their first day?" The feature-level spec is "what does this specific change need to do?"
-
-## Plans
-
-### What a plan is
-
-A plan turns a feature-spec into an ordered list of *implementable steps*. Each step:
+An ordered list of *implementable steps*. Each step:
 
 - Names the file(s) it touches
 - States in one line what changes
 - Has an acceptance criterion (test passes, type-checks, etc.)
-- Is small enough that a 7B model can do it without loading half the codebase
+- Is small enough that a small model can do it without loading half the codebase
 
-The plan itself is a file. This is the central insight you've already arrived at on this repo. Plans-as-files unlock:
+The plan is a **file**, not transient prompt text. File-ness unlocks:
 
 - Human edits before execution
 - Re-reading by the implementer on each step (no need to re-derive)
-- Status tracking (which steps are done, which failed, which are blocked)
 - Resumability across sessions
 
-### Plan format that works
+The file does **not** need to track state (which steps are done, which failed). State lives outside the file — in the orchestrator, in commits, or for fork, in tmux visibility of the running agents. Keeping the plan file pure data rather than data+state means the model has less to parse and no state to accidentally modify.
 
-A schema-shaped plan is more useful than freeform prose, because the implementer can iterate over steps mechanically. Example structure:
+## Plan format
+
+Simple. Numbered list of steps. No frontmatter, no checkboxes, no status markers.
 
 ```markdown
 # Plan: <slug>
@@ -70,40 +31,49 @@ A schema-shaped plan is more useful than freeform prose, because the implementer
 ## Goal
 <one sentence>
 
-## Spec
-<link to specs/<slug>.md>
-
 ## Steps
-1. [ ] **<file>** — <what changes>
-   - Acceptance: <how we know it worked>
-2. [ ] **<file>** — <what changes>
-   - Acceptance: <how we know it worked>
+1. **<file>** — <what changes>
+   - acceptance: <how we know it worked>
+2. **<file>** — <what changes>
+   - acceptance: <how we know it worked>
 ...
 
 ## Risks
 <things to watch for>
 ```
 
-The checkboxes give state. After each step the implementer marks it done and (if needed) appends notes. The plan file becomes the execution log.
+The orchestrator passes step N's text to the implementer. The implementer doesn't see the other steps. The plan is iterable from the outside, not "self-tracking" from the inside.
 
-### Micro-specs
+## What makes plans fail
+
+The same failure mode as specs in the broader literature: **too vague**.
+
+| Vague | Concrete |
+|---|---|
+| "Add validation" | "`src/auth.ts` — add `validateEmail(input: string): Result<Email, ValidationError>` using zod" |
+| "Hook it up" | "`src/server.ts` — call `validateEmail` in the `/signup` POST handler; 400 on error" |
+| "Fix the tests" | "`src/auth.test.ts` — add 3 cases: empty string → error, missing @ → error, valid → ok" |
+| "Handle errors properly" | "All async functions throw on failure; top-level handler in `errors.ts` reports" |
+
+The general rule: anything the small model would have to *infer* should instead be *stated* in the plan. Inference is where derpy models go wrong.
+
+## Micro-plans
 
 "Micro-specs are focused specification documents targeting single features or components — keeping LLM context manageable while enabling rapid iteration."
 
-This is the unit you actually work in. Don't write one giant plan for the whole feature; write one plan per logical chunk that fits in a single small-model session. A feature with five chunks → five plan files. The agent only ever loads one at a time.
+This is the unit you actually work in. Don't write one giant plan for a whole feature; write one plan per logical chunk that fits in a single small-model session. A feature with five chunks → five plan files. The implementer only ever loads one at a time.
 
-### Plans for derpy models specifically
+## What plans for derpy models must include
 
 When the executor is a small/local model, the plan has to do work the model can't:
 
 - **Spell out file paths exactly.** Don't say "the auth handler" — say `src/auth/handler.ts`.
-- **Spell out function signatures.** Don't say "add a validation function" — say `function validateEmail(input: string): Result<Email, ValidationError>`.
+- **Spell out function signatures.** Don't say "add a validation function" — give the signature.
 - **Spell out imports.** If a step needs `zod`, list it in the step.
 - **Resolve naming up front.** Pick names in the plan, don't leave them to the model.
+- **State acceptance.** Concrete shell command or test name, not "make sure it works."
 
-The general rule: anything the small model would have to *infer* should instead be *stated* in the plan. Inference is where derpy models go wrong.
-
-## Roles in this phase
+## Roles around the plan
 
 The Plan-then-Execute literature is clear that **weak planners are the bottleneck**. The cost-quality math:
 
@@ -113,8 +83,18 @@ The Plan-then-Execute literature is clear that **weak planners are the bottlenec
 
 So if you have access to a stronger model at all (cloud, API, or a heavier local model), use it for planning, not implementation. If you're fully local on small models, the plan must lean on the *human* and on stronger external tooling (search, docs, type-checkers) to compensate.
 
+## When to split into spec + plan
+
+The two-file split (separate `specs/<slug>.md` for problem/constraints, separate `plans/<slug>.md` for steps) pays off when:
+
+- A human is reviewing and editing intent and execution separately
+- Different agents need different views (e.g., reviewer reads the spec to check acceptance; implementer reads the plan to make changes)
+- A feature is large enough that one plan won't hold all the steps
+
+For most workflows — and for fork — one plan file is enough. The plan's "Goal" section carries the intent; the steps carry the execution.
+
 ## See also
 
 - [03-agent-patterns.md](./03-agent-patterns.md) — architectural patterns for planner/executor systems
-- [07-context-engineering.md](./07-context-engineering.md) — AGENTS.md as the project-level spec
+- [07-context-engineering.md](./07-context-engineering.md) — AGENTS.md as the project-level rules
 - [09-applying-to-fork.md](./09-applying-to-fork.md) — turning fork's `tasks/` dir into plan files

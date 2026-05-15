@@ -87,8 +87,8 @@ A practical structure:
 
 - Max 3 revise iterations per chunk
 - Each iteration uses the previous feedback verbatim
-- If still failing after 3, mark the chunk blocked and surface to the human
-- Track which chunks needed multiple iterations — those are signals that the plan step was too big
+- If still failing after 3, surface to the human and stop
+- The orchestrator owns the iteration count; nothing is persisted to the plan file
 
 ## What verifying buys you with small models
 
