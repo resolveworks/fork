@@ -40,7 +40,7 @@ If an agent definition omits `tools`, the subagent gets full tool access. Otherw
 | Command | Description |
 |---------|-------------|
 | `/agents` | List running subagents |
-| `/kill-agent` | Picker to kill (`/kill-agent scout` for direct) |
+| `/kill-agent` | Picker to kill (`/kill-agent planner` for direct) |
 
 ## Agents
 
@@ -48,15 +48,15 @@ Agent definitions live in `agents/` as markdown files with YAML frontmatter:
 
 ```markdown
 ---
-name: scout
-description: Fast codebase recon
+name: reviewer
+description: Reviews implementation with fresh eyes
 tools: read, grep, find, ls, bash
 ---
 
-You are a scout...
+You are a code reviewer...
 ```
 
-Four agents are included: **scout**, **planner**, **worker**, **reviewer**. Add your own by dropping `.md` files into `agents/`.
+Three agents are included: **planner**, **implementer**, **reviewer**. Add your own by dropping `.md` files into `agents/`.
 
 Agents are discovered from three directories (first match wins):
 1. `~/.pi/agent/agents/` (user-global)

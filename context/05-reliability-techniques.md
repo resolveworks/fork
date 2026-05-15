@@ -37,7 +37,7 @@ Even without constrained decoding, schemas serve as design contracts:
 
 - The plan format is a schema (sections, checklist items)
 - The implementer's output (diffs) has a schema (file path + content)
-- The verifier's output has a schema (pass/fail + errors)
+- The reviewer's output has a schema (pass/fail + errors)
 
 The agent doesn't need fancy decoding to benefit — just clear formats with examples. With a small model, *include the schema and an example in the prompt*. Don't trust the model to invent the format.
 

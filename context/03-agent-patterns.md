@@ -78,19 +78,19 @@ The same benchmark found Opus-driving-Kimi cost 3× more than Kimi-solo when pla
 
 From the same research: "Verification rounds are the hidden win. If your orchestrator prompt includes 'write then verify then fix,' you'll see quality lift. If it just includes 'delegate everything,' you'll see cost lift without quality lift."
 
-Translation: adding a *verifier* (not just a planner and an executor) is where the quality actually comes from. See [04-verification.md](./04-verification.md).
+Translation: adding a *reviewer* (not just a planner and an executor) is where the quality actually comes from. See [04-verification.md](./04-verification.md).
 
 ## What to use for coding with small local models
 
-Default: **Plan-and-Execute + verifier loop**.
+Default: **Plan-and-Execute + reviewer loop**.
 
 - Plan-and-Execute fits coding work (sequential, requires reaction to results)
 - ReWOO is overkill — you'll need to replan anyway when tests fail
 - LLMCompiler only helps if you have parallelizable subtasks
-- The verifier is non-optional; without it you're just splitting work, not improving it
+- The reviewer is non-optional; without it you're just splitting work, not improving it
 
 ## See also
 
 - [02-specs-and-planning.md](./02-specs-and-planning.md) — what the planner produces
-- [04-verification.md](./04-verification.md) — the verifier step in detail
+- [04-verification.md](./04-verification.md) — the reviewer step in detail
 - [06-small-models.md](./06-small-models.md) — capability constraints to design around

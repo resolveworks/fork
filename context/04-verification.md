@@ -15,7 +15,7 @@ The basic structure:
               ▼
        ┌─────────────┐
        │  Evaluate   │
-       │ (verifier)  │
+       │ (reviewer)  │
        └──────┬──────┘
               │
          pass │ fail
@@ -49,7 +49,7 @@ The fix is not "use a smarter model for review" — it is **external verificatio
 
 The CRITIC framework (2023) made this explicit: have the LLM generate a response, then use *external tools* (Python interpreter, search, classifier) to verify factual claims, code, or safety. The verification is mechanical, not LLM-driven.
 
-## Building a verifier for coding work
+## Building a reviewer for coding work
 
 Concrete external signals for code:
 
@@ -57,17 +57,17 @@ Concrete external signals for code:
 2. **Tests.** The plan should generate or include the tests. Failures feed back as text.
 3. **Lint.** Catches style drift and some classes of bugs.
 4. **Run the code.** For scripts, just run it. For services, hit the endpoint.
-5. **Diff against spec.** A reviewer agent reads the diff *with the spec loaded* and checks acceptance criteria. This is where soft signals enter, but they're anchored against a written spec.
+5. **Diff against spec.** A reviewer agent reads the diff *with the spec loaded* and checks acceptance criteria. This is where soft signals enter — but they're anchored against a written spec, not vibes.
 
 Layer them. Compile first (instant). Lint next (fast). Tests (slower). Reviewer agent last (slowest, most context).
 
-## When LLM-as-verifier actually works
+## When LLM-as-reviewer actually works
 
-Cross-model correction works when the verifier model is *different from* the generator. Most successful patterns use:
+Cross-model correction works when the reviewer model is *different from* the generator. Most successful patterns use:
 
-- Small fine-tuned verifier vs. larger general-purpose generator
+- Small fine-tuned reviewer vs. larger general-purpose generator
 - Multi-agent debate between models with similar capabilities
-- A verifier that has *the spec loaded* and the generator that doesn't
+- A reviewer that has *the spec loaded* and the generator that doesn't
 
 The pattern that doesn't work: same model, same prompt, "review your answer." Avoid.
 
@@ -75,11 +75,11 @@ The pattern that doesn't work: same model, same prompt, "review your answer." Av
 
 From the agent-loops literature, three patterns to watch:
 
-1. **Weak / gameable scoring.** If the verifier is a soft LLM judge, the generator learns to please the judge rather than solve the task. Mitigated by hard external signals.
+1. **Weak / gameable scoring.** If the reviewer is a soft LLM judge, the generator learns to please the judge rather than solve the task. Mitigated by hard external signals.
 
 2. **Underspecified tasks.** If there's no clear notion of "better," refinement has nowhere to go. Mitigated by acceptance criteria in the plan / spec.
 
-3. **Error amplification.** Repeated revise attempts compound mistakes — the generator latches onto a wrong direction and the verifier rationalizes it. Mitigated by stopping after a couple of attempts and falling back to human review.
+3. **Error amplification.** Repeated revise attempts compound mistakes — the generator latches onto a wrong direction and the reviewer rationalizes it. Mitigated by stopping after a couple of attempts and falling back to human review.
 
 ## Knowing when to stop
 
@@ -89,23 +89,24 @@ A revise-on-failure dance can compound mistakes if it goes on too long. The prac
 - Each attempt should include the previous failure text verbatim — don't paraphrase it
 - If the same kind of failure keeps appearing, the plan step was probably wrong; replan rather than retry
 
-## What verifying buys you with small models
+## What reviewing buys you with small models
 
-The cost-benefit is good. Small models are cheap to run, so iteration is cheap. The verifier catches the exact failure modes small models are prone to (hallucinated APIs, wrong imports, missed edge cases) using cheap external signals. The combination — cheap generator + cheap external verifier — has been shown to match much larger single-model setups on schema-bounded tasks.
+The cost-benefit is good. Small models are cheap to run, so iteration is cheap. The reviewer catches the exact failure modes small models are prone to (hallucinated APIs, wrong imports, missed edge cases) using cheap external signals. The combination — cheap generator + cheap reviewer — has been shown to match much larger single-model setups on schema-bounded tasks.
 
-The benchmark result that matters: "Well-orchestrated small models can match or exceed larger single-agent baselines, with performance driven primarily by the capacity of the Orchestrator rather than the size of execution sub-agents." For fork, the "orchestrator" is just the parent agent making per-turn decisions — that agent's quality is what determines whether the verify pattern lifts results.
+The benchmark result that matters: "Well-orchestrated small models can match or exceed larger single-agent baselines, with performance driven primarily by the capacity of the Orchestrator rather than the size of execution sub-agents." For fork, the "orchestrator" is just the parent agent making per-turn decisions — that agent's quality is what determines whether the review pattern lifts results.
 
 ## Concrete shape (per chunk)
 
-The verifier's job, on one dispatch:
+The reviewer's job, on one dispatch:
 
 1. Read the diff (or apply it and inspect)
 2. Run type-check / lint / tests as shell commands
-3. Report: pass, or the specific errors
+3. Read the code with fresh eyes — check for design issues, mismatch with intent, missed edge cases
+4. Report: pass, or the specific failures (mechanical and judgment-based)
 
-That's it — one pass, one report. The parent agent (or human) decides whether to re-dispatch the implementer with the errors, accept the diff anyway, or give up. The verifier itself doesn't loop.
+That's it — one pass, one report. The parent agent (or human) decides whether to re-dispatch the implementer with the errors, accept the diff anyway, or give up. The reviewer itself doesn't loop.
 
-The point: most failures get caught by shell commands (type-check, lint, tests). Those are non-LLM, fast, and cheap. The verifier is mostly a wrapper around running them and aggregating output — not a sophisticated reviewer.
+The point: most failures get caught by shell commands (type-check, lint, tests). Those are non-LLM, fast, and cheap. The reviewer is mostly a wrapper around running them and aggregating output — but it also brings fresh eyes, which mechanical checks alone miss.
 
 ## See also
 

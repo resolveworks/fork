@@ -33,10 +33,11 @@ Communication is file-based: children write to `~/.pi/agent/extensions/fork/resu
 
 ### Agents
 
-Two agents are hardcoded in `index.ts`:
+Three agents are hardcoded in `index.ts`:
 
-- **planner** — Read-only planning specialist. Receives context and requirements, then produces a clear implementation plan.
+- **planner** — Read-only planning specialist. Reads code, gathers context, and produces a clear implementation plan.
 - **implementer** — Executes plans by making concrete code changes. Has full tool access.
+- **reviewer** — Reviews implementation with fresh eyes. Runs external checks (type-checker, linter, tests) and exercises judgment.
 
 This keeps the interplay between them tightly controlled and easy to iterate on.
 

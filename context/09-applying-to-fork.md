@@ -8,17 +8,17 @@ fork is already in good shape on several axes:
 
 | Best practice | fork's current state |
 |---|---|
-| Plan-and-Execute pattern | yes — `planner` + `implementer` agents |
-| Isolated subagent context | yes — each runs in its own pi session |
-| Project-level rules | yes — AGENTS.md |
-| Compact system prompts | yes — agent prompts are short |
-| Visibility into running work | yes — tmux windows give full view |
-| File-based handoff | partial — `tasks/` exists but is transient |
-| Plans as durable artifacts | **no** — gap (planner returns text in a notification) |
-| External verification | **no** — gap |
-| One step at a time | **no** — gap; one task = whole feature |
+| Plan-and-Execute pattern | yes - `planner` + `implementer` agents |
+| Isolated subagent context | yes - each runs in its own pi session |
+| Project-level rules | yes - AGENTS.md |
+| Compact system prompts | yes - agent prompts are short |
+| Visibility into running work | yes - tmux windows give full view |
+| File-based handoff | partial - `tasks/` exists but is transient |
+| Plans as durable artifacts | **no** - gap (planner returns text in a notification) |
+| External verification | **no** - gap |
+| One step at a time | **no** - gap; one task = whole feature |
 
-The biggest gaps are **plans-as-files** and **a verifier**. These are the two highest-leverage additions per the research.
+The biggest gaps are **plans-as-files** and **a reviewer**. These are the two highest-leverage additions per the research.
 
 ## Design principles for fork
 
@@ -33,7 +33,7 @@ A few constraints that should shape every change:
 
 In order of impact. Each is a discrete change you could ship independently.
 
-### 1. Plans as durable files (highest priority — your original idea)
+### 1. Plans as durable files (highest priority - your original idea)
 
 **Today:** planner returns a text summary that gets surfaced as a notification. The plan exists only in the conversation transcript.
 
@@ -50,26 +50,26 @@ In order of impact. Each is a discrete change you could ship independently.
 <one sentence>
 
 ## Steps
-1. **<file>** — <what changes>
+1. **<file>** - <what changes>
    - acceptance: <how we know it worked>
-2. **<file>** — <what changes>
+2. **<file>** - <what changes>
    - acceptance: <how we know it worked>
 
 ## Risks
 <things to watch for>
 ```
 
-### 2. Add a verifier agent
+### 2. Add a reviewer agent
 
-**Today:** no verification step. Implementer reports back; main session moves on.
+**Today:** no review step. Implementer reports back; main session moves on.
 
-**Change:** add a third hardcoded agent: `verifier`. It receives the step text and the diff (or a description of changes), runs type-check / lint / tests as shell commands, and reports pass or a list of specific failures.
+**Change:** add a third hardcoded agent: `reviewer`. It receives the step text and the diff (or a description of changes), runs type-check / lint / tests as shell commands, and reports pass or a list of specific failures. But it also exercises judgment — reading the code with fresh eyes, catching issues that tools miss, checking whether the implementation matches the intent.
 
-The parent agent decides what to do with the verifier's report — re-dispatch the implementer with the failures, dispatch the next step, or surface to the human. There's no automated retry loop in fork's code; the parent agent's turn is the decision point.
+The parent agent decides what to do with the reviewer's report — re-dispatch the implementer with the failures, dispatch the next step, or surface to the human. There's no automated retry loop in fork's code; the parent agent's turn is the decision point.
 
 **Why:** "Verification rounds are the hidden win." This is the single biggest expected quality lift.
 
-**Caveat:** the verifier *must* use external signals (type-checker, tests). Pure LLM self-critique can lower quality. The agent's job is to *run* the external tools and aggregate output, not to "review" the code with model intuition.
+**Caveat:** the reviewer *must* use external signals (type-checker, tests) as a foundation. Pure LLM self-critique can lower quality. But mechanical checks alone miss design-level issues — the reviewer layers judgment on top of hard signals.
 
 ### 3. One step per implementer dispatch
 
@@ -82,7 +82,7 @@ The parent agent decides what to do with the verifier's report — re-dispatch t
 - The named files (full content if small, summaries if large)
 - Nothing else
 
-The parent agent dispatches step 1, gets a result, dispatches step 2, etc. — making per-turn decisions, not running a loop.
+The parent agent dispatches step 1, gets a result, dispatches step 2, etc. - making per-turn decisions, not running a loop.
 
 **Trade-off:** more tmux windows. But each window's job is small enough that a 7B model can do it, and tmux already gives the human visibility into all of them.
 
@@ -92,24 +92,22 @@ The parent agent dispatches step 1, gets a result, dispatches step 2, etc. — m
 
 **Change:** keep them this way. Resist adding instructions. If you find yourself wanting more, that's a sign the plan needs to carry it.
 
-The pattern: project rules (in AGENTS.md, loaded by pi) + the step text (passed as the task) + nothing else in the system prompt. Agent instructions stay terse — "implement this step, then stop."
+The pattern: project rules (in AGENTS.md, loaded by pi) + the step text (passed as the task) + nothing else in the system prompt. Agent instructions stay terse - "implement this step, then stop."
 
-### 5. (Optional) Add a scout agent
+### 5. (Optional) Round out the workflow with a reviewer
 
-The original README mentioned scout, planner, worker, reviewer. A scout — read-only, gathers context from the codebase before planning — fits the [07-context-engineering.md](./07-context-engineering.md) story: the planner shouldn't have to discover files; the scout finds them and passes a curated context to the planner.
-
-Lower priority than 1–4, but rounds out the workflow.
+The reviewer agent completes the plan → implement → review loop. It has fresh eyes, the spec loaded, and access to external tools. This is where soft signals enter — but anchored against the plan's acceptance criteria, not vibes.
 
 ## What *not* to add
 
 Things the research suggests against, despite being tempting:
 
-- **State anywhere — files, parent memory, retry counters.** The parent agent's per-turn decisions are enough. tmux gives live visibility.
+- **State anywhere - files, parent memory, retry counters.** The parent agent's per-turn decisions are enough. tmux gives live visibility.
 - **A separate spec file alongside the plan.** Doubles the artifact count for marginal benefit. AGENTS.md covers project rules; the plan's goal section covers intent.
 - **Automated retry loops in fork's code.** The parent agent decides per turn whether to re-dispatch the implementer. Don't hard-code a loop.
-- **Updating the plan file after it's written.** Plans are write-once. If the plan is wrong, replan — make a new file.
+- **Updating the plan file after it's written.** Plans are write-once. If the plan is wrong, replan - make a new file.
 - **More-clever planner prompts.** Per [03-agent-patterns.md](./03-agent-patterns.md), the weak-planner problem isn't fixed by prompt cleverness.
-- **Self-critique loops without external signals.** Per [04-verification.md](./04-verification.md), this lowers quality. The verifier must run real tools.
+- **Self-critique loops without external signals.** Per [04-verification.md](./04-verification.md), this lowers quality. The reviewer must run real tools as a foundation, then layer judgment on top.
 - **Generalist agents.** The pattern is *specialist* agents with narrow scope, not one capable generalist.
 
 ## A target architecture
@@ -117,19 +115,17 @@ Things the research suggests against, despite being tempting:
 Putting it together, this is roughly what a v2 fork looks like:
 
 ```
-  ┌─────────┐    ┌─────────┐
-  │ scout   │ →  │ planner │   →  plan.md (numbered steps, write-once)
-  │ (opt)   │    │         │
-  └─────────┘    └─────────┘
-                                     
+  ┌─────────────┐
+  │  planner    │  →  plan.md (numbered steps, write-once)
+  └─────────────┘
+
   parent agent reads plan.md, picks a step, dispatches:
-                                       
-      ┌──────────────┐    ┌──────────┐
-      │ implementer  │    │ verifier │
-      │  (one step)  │    │ (one     │
-      │              │    │  check)  │
-      └──────────────┘    └──────────┘
-                                       
+
+      ┌──────────────┐    ┌──────────────┐
+      │ implementer  │    │   reviewer   │
+      │  (one step)  │    │  (one check) │
+      └──────────────┘    └──────────────┘
+
   results come back via fork-result notifications.
   parent agent takes a new turn, decides what to dispatch next.
   human watches via tmux, intervenes if needed.
@@ -141,7 +137,7 @@ This is what the research converges on, mapped onto the building blocks you alre
 
 ## See also
 
-- [README.md](./README.md) — index
-- [01-core-loop.md](./01-core-loop.md) — the underlying workflow this maps to
-- [02-specs-and-planning.md](./02-specs-and-planning.md) — plan file shape
-- [04-verification.md](./04-verification.md) — designing the verifier
+- [README.md](./README.md) - index
+- [01-core-loop.md](./01-core-loop.md) - the underlying workflow this maps to
+- [02-specs-and-planning.md](./02-specs-and-planning.md) - plan file shape
+- [04-verification.md](./04-verification.md) — designing the reviewer
