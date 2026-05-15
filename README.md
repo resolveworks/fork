@@ -33,32 +33,11 @@ When a subagent completes cleanly, its findings are delivered to the parent sess
 
 ### Tool access
 
-If an agent definition omits `tools`, the subagent gets full tool access. Otherwise it is limited to the listed tools plus `report` (for manual reporting after abort).
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `/agents` | List running subagents |
-| `/kill-agent` | Picker to kill (`/kill-agent planner` for direct) |
+If an agent definition has no `tools` specified, the subagent inherits pi's full default tool set. Otherwise it is limited to the listed tools plus `report` (for manual reporting after abort).
 
 ## Agents
 
-Agent definitions live in `agents/` as markdown files with YAML frontmatter:
+Two agents are hardcoded in `index.ts`:
 
-```markdown
----
-name: reviewer
-description: Reviews implementation with fresh eyes
-tools: read, grep, find, ls, bash
----
-
-You are a code reviewer...
-```
-
-Three agents are included: **planner**, **implementer**, **reviewer**. Add your own by dropping `.md` files into `agents/`.
-
-Agents are discovered from three directories (first match wins):
-1. `~/.pi/agent/agents/` (user-global)
-2. `.pi/agents/` (project-local)
-3. `agents/` (built-in)
+- **planner** — Read-only planning specialist. Reads code, gathers context, and produces a clear implementation plan.
+- **implementer** — Executes plans by making concrete code changes. Gets pi's full default tool set.
