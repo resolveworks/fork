@@ -52,7 +52,6 @@ function socketPathFor(parentSessionId: string): string {
 interface ResultPayload {
 	id: string;
 	agent: string;
-	tmuxWindow: string;
 	success: boolean;
 	takenOver: boolean;
 	stopReason: string;
@@ -320,7 +319,7 @@ const agentByName = new Map(agents.map((a) => [a.name, a]));
 // ── parent: dispatcher ──────────────────────────────────────────────
 
 class Dispatcher {
-	private active = new Map<string, { agent: SubAgent<any, any>; params: any }>();
+	private active = new Map<string, { agent: SubAgent<any, any>; params: any; tmuxWindow: string }>();
 	private finalized = new Set<string>();
 	private session: string;
 	private currentSessionId: string | null = null;
@@ -366,13 +365,11 @@ class Dispatcher {
 			id,
 			"--subagent-socket",
 			socketPathFor(this.currentSessionId),
-			"--subagent-window",
-			win,
 			`@${taskPath}`,
 		].join(" ");
 		tmux(`send-keys -t ${this.session}:${win} ${JSON.stringify(cmd)} Enter`);
 
-		this.active.set(id, { agent, params });
+		this.active.set(id, { agent, params, tmuxWindow: win });
 
 		return {
 			content: [
@@ -387,7 +384,10 @@ class Dispatcher {
 	deliverResult(payload: ResultPayload): void {
 		if (this.finalized.has(payload.id)) return;
 
-		const message = this.formatDelivery(payload);
+		const slot = this.active.get(payload.id);
+		const tmuxWindow = slot?.tmuxWindow ?? "";
+
+		const message = this.formatDelivery(payload, slot);
 
 		this.pi.sendMessage(
 			{
@@ -401,26 +401,29 @@ class Dispatcher {
 
 		if (!payload.takenOver) {
 			this.finalized.add(payload.id);
-			if (payload.tmuxWindow) {
-				tmux(`kill-window -t ${this.session}:${payload.tmuxWindow}`);
+			this.active.delete(payload.id);
+			if (tmuxWindow) {
+				tmux(`kill-window -t ${this.session}:${tmuxWindow}`);
 			}
 			fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
 		}
 	}
 
-	private formatDelivery(data: ResultPayload): {
+	private formatDelivery(
+		data: ResultPayload,
+		slot: { agent: SubAgent<any, any>; params: any; tmuxWindow: string } | undefined,
+	): {
 		content: string;
 		details: unknown;
 	} {
 		if (data.takenOver) {
+			const tmuxWindow = slot?.tmuxWindow ?? "";
 			return {
-				content: `Subagent **${data.agent}** (window ${data.tmuxWindow}) was taken over — no findings returned. (stopReason: ${data.stopReason})`,
+				content: `Subagent **${data.agent}** (window ${tmuxWindow}) was taken over — no findings returned. (stopReason: ${data.stopReason})`,
 				details: data,
 			};
 		}
 
-		const slot = this.active.get(data.id);
-		this.active.delete(data.id);
 		if (!slot) {
 			// Orphaned result (e.g. recovered after restart) — deliver raw.
 			return {
@@ -496,7 +499,6 @@ function setupParent(pi: ExtensionAPI): void {
 function setupChild(pi: ExtensionAPI, agent: SubAgent<any, any>): void {
 	const id = pi.getFlag("subagent-id") as string | undefined;
 	const socketPath = pi.getFlag("subagent-socket") as string | undefined;
-	const tmuxWindow = (pi.getFlag("subagent-window") as string | undefined) ?? "";
 	if (!id) throw new Error("fork: subagent missing required --subagent-id flag");
 	if (!socketPath)
 		throw new Error("fork: subagent missing required --subagent-socket flag");
@@ -521,7 +523,6 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any, any>): void {
 		const payload: ResultPayload = {
 			id,
 			agent: agent.name,
-			tmuxWindow,
 			timestamp: Date.now(),
 			...partial,
 		};
@@ -621,10 +622,6 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.registerFlag("subagent-socket", {
 		description: "Parent socket path (internal)",
-		type: "string",
-	});
-	pi.registerFlag("subagent-window", {
-		description: "Subagent tmux window (internal)",
 		type: "string",
 	});
 
