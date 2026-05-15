@@ -4,6 +4,17 @@
 
 **fork** is a [pi](https://github.com/earendil-works/pi) extension that manages subagents as separate interactive pi sessions in tmux windows. When the LLM calls the `subagent` tool, fork spawns a new tmux window running a full pi session with an isolated context window. Results flow back to the parent as notification messages when a subagent completes.
 
+## Philosophy
+
+This project follows a **fail-fast** philosophy:
+
+- **No defensive programming.** Don't anticipate and silently swallow failures. If something is wrong, crash loudly.
+- **No fallbacks.** If an environment variable or config is missing, that's a bug — not an opportunity for a default. Error immediately and tell the user what they forgot.
+- **No backward compatibility.** We don't maintain old behavior or migration paths. Break things cleanly and move forward.
+- **Explicit over implicit.** Dependencies, requirements, and failure modes should be obvious from the code — not hidden behind defaults or `try/catch` blocks that eat errors.
+
+If you're adding error handling: ask yourself whether the error represents a programmer mistake or a missing prerequisite. If so, throw or crash — don't recover.
+
 ## Project Structure
 
 ```
@@ -70,7 +81,7 @@ All runtime state lives under `~/.pi/agent/extensions/fork/`:
 - **Agent definitions** are hardcoded in the `AGENTS` array near the top of `index.ts`.
 - **No build step.** pi loads `.ts` files directly via its runtime.
 - **No tests currently.** If adding tests, note the heavy tmux dependency would need mocking.
-- **Error handling** is defensive — most failures return empty strings or silently catch, since tmux may not be available.
+- **Error handling** follows fail-fast: if something is wrong, throw or crash with a clear message. No silent catches, no empty-string fallbacks. If tmux isn't available, say so and fail.
 - **File permissions:** Task files are written with mode `0o600` (user-only read/write).
 
 ## Making Changes
