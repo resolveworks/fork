@@ -26,7 +26,7 @@ Six concrete levers in order of impact:
 | [01-core-loop.md](./01-core-loop.md) | The proven loop end-to-end: spec → plan → chunk → verify |
 | [02-specs-and-planning.md](./02-specs-and-planning.md) | Plan file shape; micro-plans; what to spell out for derpy models |
 | [03-agent-patterns.md](./03-agent-patterns.md) | Plan-and-Execute, ReWOO, LLMCompiler; and the mixing-models caveat |
-| [04-verification.md](./04-verification.md) | Two-layer verification: pre-commit hooks (mechanical, per step) + reviewer (judgment, per plan); structured verdicts |
+| [04-verification.md](./04-verification.md) | Two-layer verification: pre-commit hooks (mechanical, per step) + reviewer (judgment, per step); structured verdicts |
 | [05-reliability-techniques.md](./05-reliability-techniques.md) | Constrained decoding, schemas, the reasoning trade-off |
 | [06-small-models.md](./06-small-models.md) | What SLMs can and can't do; the 7B tool-calling cliff |
 | [07-context-engineering.md](./07-context-engineering.md) | AGENTS.md, hierarchical context, what to load when |

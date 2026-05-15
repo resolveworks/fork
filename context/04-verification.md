@@ -59,17 +59,19 @@ Compile / type-check, lint, and tests run automatically as git pre-commit hooks.
 
 This means the cheapest, highest-signal checks happen **at commit time, automatically, on every step.** The implementer doesn't need to be told to run them — the commit itself enforces them.
 
-### Layer 2: Reviewer agent (per plan)
+### Layer 2: Reviewer agent (per step)
 
-Once all steps have committed (hooks passing), a reviewer agent reads the full plan diff with the spec loaded. This is where soft signals enter — but they're anchored against a written spec, not vibes.
+After each step commits (hooks passing), a reviewer agent reads the step's diff with the step text and acceptance criteria loaded. This is where soft signals enter — but they're anchored against a written spec, not vibes.
 
-The reviewer's job is **judgment only**. Hooks already caught type errors, lint violations, and test failures. The reviewer brings fresh eyes for things hooks can't check:
+The reviewer's job is **judgment only**. Hooks already caught type errors, lint violations, and test failures — the implementer won't return until the commit lands. The reviewer brings fresh eyes for things hooks can't check:
 
 - Design issues: is this the right approach?
-- Intent mismatch: does the implementation match the plan's acceptance criteria?
+- Intent mismatch: does the implementation match the step's acceptance criteria?
 - Edge cases: what breaks at the boundaries?
 - Security: anything exposed that shouldn't be?
 - Consistency: does this fit with the rest of the codebase?
+
+Reviewing per step (rather than per plan) catches design issues early, before later steps build on a wrong foundation. The cost is more reviewer dispatches; the saving is smaller, cheaper reviews and less rework when something is off.
 
 ## When LLM-as-reviewer actually works
 
@@ -105,12 +107,12 @@ The cost-benefit is good. Small models are cheap to run, so iteration is cheap. 
 
 The benchmark result that matters: "Well-orchestrated small models can match or exceed larger single-agent baselines, with performance driven primarily by the capacity of the Orchestrator rather than the size of execution sub-agents." For fork, the "orchestrator" is just the parent agent making per-turn decisions — that agent's quality is what determines whether the review pattern lifts results.
 
-## Concrete shape (per plan)
+## Concrete shape (per step)
 
 The reviewer's job, on one dispatch:
 
-1. Read the plan and its acceptance criteria
-2. Read the full diff (all steps on the feature branch)
+1. Read the step text and its acceptance criteria
+2. Read the step's diff (just this step's commit)
 3. Read the code with fresh eyes — design issues, mismatch with intent, missed edge cases
 4. Report a **structured verdict**:
 
@@ -121,9 +123,9 @@ issues:
   - src/auth.ts:58 — missing error response for invalid email, returns 200 silently
 ```
 
-`pass` → parent merges the branch. `changes-needed` → parent re-dispatches the implementer with the issues as the task. The reviewer itself doesn't loop — it reports once, the parent decides.
+`pass` → parent dispatches the next step. `changes-needed` → parent re-dispatches the implementer with the issues as the task. The reviewer itself doesn't loop — it reports once, the parent decides.
 
-The key shift: the reviewer doesn't run linters or tests. Pre-commit hooks already caught mechanical failures on every step. The reviewer is a judgment layer on top, catching the things tools miss — and its output is structured so the parent agent can act on it without interpreting free-form prose.
+The key shift: the reviewer doesn't run linters or tests. The implementer already committed — hooks passed — so mechanical failures are already caught. The reviewer is a judgment layer on top, catching the things tools miss — and its output is structured so the parent agent can act on it without interpreting free-form prose.
 
 ## See also
 
