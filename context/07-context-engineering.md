@@ -108,4 +108,3 @@ It replaces prompt engineering as the primary lever. Prompt wording matters but 
 
 - [02-specs-and-planning.md](./02-specs-and-planning.md) — the plan file shape
 - [08-local-tooling.md](./08-local-tooling.md) — how Cline / Aider / Continue handle context loading
-- [09-applying-to-fork.md](./09-applying-to-fork.md) — context loading strategy for fork's subagents

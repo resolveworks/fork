@@ -144,4 +144,3 @@ Real-world hardware → model fits:
 
 - [05-reliability-techniques.md](./05-reliability-techniques.md) — why these settings matter
 - [06-small-models.md](./06-small-models.md) — capability profiles per model
-- [09-applying-to-fork.md](./09-applying-to-fork.md) — how fork should compose with this stack

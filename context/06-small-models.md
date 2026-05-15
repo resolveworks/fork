@@ -103,4 +103,3 @@ This is what the rest of this knowledge base is about.
 
 - [05-reliability-techniques.md](./05-reliability-techniques.md) — constrained decoding for the structured-output problem
 - [08-local-tooling.md](./08-local-tooling.md) — concrete configurations for the models above
-- [09-applying-to-fork.md](./09-applying-to-fork.md) — designing fork for these capability limits

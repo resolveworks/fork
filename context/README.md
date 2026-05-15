@@ -31,7 +31,6 @@ Six concrete levers in order of impact:
 | [06-small-models.md](./06-small-models.md) | What SLMs can and can't do; the 7B tool-calling cliff |
 | [07-context-engineering.md](./07-context-engineering.md) | AGENTS.md, hierarchical context, what to load when |
 | [08-local-tooling.md](./08-local-tooling.md) | Cline + LM Studio, Aider, Continue concrete settings |
-| [09-applying-to-fork.md](./09-applying-to-fork.md) | Synthesis: what this repo should look like |
 | [sources.md](./sources.md) | All references |
 
-Start with [01-core-loop.md](./01-core-loop.md) if you read one file. Read [09-applying-to-fork.md](./09-applying-to-fork.md) before changing this repo's code.
+Start with [01-core-loop.md](./01-core-loop.md) if you read one file.

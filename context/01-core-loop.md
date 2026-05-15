@@ -78,4 +78,3 @@ It replaces the dominant 2023-era pattern of "tell the agent the whole goal and 
 - [02-specs-and-planning.md](./02-specs-and-planning.md) — the plan file shape
 - [03-agent-patterns.md](./03-agent-patterns.md) — architectural variants of plan-and-execute
 - [04-verification.md](./04-verification.md) — the verify step in detail
-- [09-applying-to-fork.md](./09-applying-to-fork.md) — how this maps onto fork's planner/implementer split

@@ -97,4 +97,3 @@ For most workflows — and for fork — one plan file is enough. The plan's "Goa
 
 - [03-agent-patterns.md](./03-agent-patterns.md) — architectural patterns for planner/executor systems
 - [07-context-engineering.md](./07-context-engineering.md) — AGENTS.md as the project-level rules
-- [09-applying-to-fork.md](./09-applying-to-fork.md) — turning fork's `tasks/` dir into plan files
