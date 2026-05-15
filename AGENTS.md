@@ -65,9 +65,9 @@ This keeps the interplay between them tightly controlled and easy to iterate on.
 4. Parent's socket connection handler parses the JSON line and delivers a `fork-result` notification → triggers a new parent turn
 5. Clean completions automatically close the subagent's tmux window and remove its task file
 
-### Reload Safety
+### Lifecycle hooks
 
-The extension uses `globalThis.__fork_server` (and the matching `__fork_server_path`) to remember the listening socket across hot reloads within the same pi process. On reload, the previous server is closed and its socket file unlinked before the new one starts listening. Cleanup is for *known* prior state we placed there — stale sockets from a crashed prior process are not preemptively removed; `listen` will throw `EADDRINUSE` and the user clears the file.
+Setup and teardown ride pi's own events: the socket server is created in `session_start` and closed (with its socket file unlinked) in `session_shutdown`. `session_shutdown` fires on `quit`, `reload`, `new`, `resume`, and `fork` — every case where the extension instance is torn down — so no `globalThis` bookkeeping is needed to survive hot reloads. Each extension instance owns its own server in a closure. Stale sockets from a crashed prior process are not preemptively removed; `listen` will throw `EADDRINUSE` and the user clears the file.
 
 ## Shared Paths
 

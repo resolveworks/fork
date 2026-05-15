@@ -453,23 +453,15 @@ function setupParent(pi: ExtensionAPI): void {
 	fs.mkdirSync(TASKS_DIR, { recursive: true });
 
 	const dispatcher = new Dispatcher(pi);
+	let server: net.Server | null = null;
+	let sockPath: string | null = null;
 
 	pi.on("session_start", (_event, ctx) => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		dispatcher.setSessionId(sessionId);
 
-		// Planned cleanup of a server left by a previous extension load in this
-		// same process (pi's hot-reload model). We don't preemptively clean
-		// sockets from other processes — `listen` will throw EADDRINUSE.
-		const prevServer = (globalThis as any).__fork_server as net.Server | undefined;
-		const prevPath = (globalThis as any).__fork_server_path as string | undefined;
-		if (prevServer) {
-			prevServer.close();
-			if (prevPath) fs.unlinkSync(prevPath);
-		}
-
-		const sockPath = socketPathFor(sessionId);
-		const server = net.createServer((socket) => {
+		sockPath = socketPathFor(sessionId);
+		server = net.createServer((socket) => {
 			let buf = "";
 			socket.setEncoding("utf-8");
 			socket.on("data", (chunk: string) => {
@@ -485,10 +477,15 @@ function setupParent(pi: ExtensionAPI): void {
 			});
 		});
 		server.listen(sockPath, () => {
-			fs.chmodSync(sockPath, 0o600);
+			fs.chmodSync(sockPath!, 0o600);
 		});
-		(globalThis as any).__fork_server = server;
-		(globalThis as any).__fork_server_path = sockPath;
+	});
+
+	pi.on("session_shutdown", () => {
+		server?.close();
+		if (sockPath) fs.unlinkSync(sockPath);
+		server = null;
+		sockPath = null;
 	});
 
 	for (const a of agents) a.registerTool(pi, dispatcher);
