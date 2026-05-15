@@ -63,26 +63,39 @@ In order of impact. Each is a discrete change you could ship independently.
 
 **Today:** no review step. Implementer reports back; main session moves on.
 
-**Change:** add a third hardcoded agent: `reviewer`. It receives the step text and the diff (or a description of changes), runs type-check / lint / tests as shell commands, and reports pass or a list of specific failures. But it also exercises judgment — reading the code with fresh eyes, catching issues that tools miss, checking whether the implementation matches the intent.
+**Change:** add a third hardcoded agent: `reviewer`. Its job is **judgment only** — it doesn't run linters, type-checkers, or tests. Pre-commit hooks already handle those mechanical checks at commit time (see section 3). The reviewer reads the full plan diff with the spec loaded and checks for things hooks can't catch: design issues, intent mismatch, edge cases, security concerns.
 
-The parent agent decides what to do with the reviewer's report — re-dispatch the implementer with the failures, dispatch the next step, or surface to the human. There's no automated retry loop in fork's code; the parent agent's turn is the decision point.
+The reviewer reports a **structured verdict**:
 
-**Why:** "Verification rounds are the hidden win." This is the single biggest expected quality lift.
+```
+verdict: pass | changes-needed
+issues:
+  - src/auth.ts:42 — `parseEmail` doesn't handle null input, will throw at runtime
+  - src/auth.ts:58 — missing error response for invalid email, returns 200 silently
+```
 
-**Caveat:** the reviewer *must* use external signals (type-checker, tests) as a foundation. Pure LLM self-critique can lower quality. But mechanical checks alone miss design-level issues — the reviewer layers judgment on top of hard signals.
+`pass` → parent merges the feature branch. `changes-needed` → parent re-dispatches the implementer with the issues as the task. The reviewer itself doesn't loop — it reports once, the parent decides.
 
-### 3. One step per implementer dispatch
+**Why:** "Verification rounds are the hidden win." This is the single biggest expected quality lift. The structured verdict means the parent agent can act without interpreting free-form prose — critical for derpy models.
 
-**Today:** implementer is invoked once with a freeform task string and is expected to do the whole thing.
+**Caveat:** the reviewer operates *after* hooks have passed. It's a judgment layer on top of mechanical checks, not a replacement for them.
 
-**Change:** dispatch the implementer for **one step at a time**, with the step's text as the task. The agent sees:
+### 3. Feature branches + one step per implementer dispatch
+
+**Today:** implementer is invoked once with a freeform task string and is expected to do the whole thing. Changes land wherever.
+
+**Change:** the planner creates a feature branch (`plan/<slug>`) when it writes the plan. The implementer is dispatched for **one step at a time**, with the step's text as the task. The agent sees:
 
 - The project rules (AGENTS.md)
 - Its specific step text
 - The named files (full content if small, summaries if large)
 - Nothing else
 
-The parent agent dispatches step 1, gets a result, dispatches step 2, etc. - making per-turn decisions, not running a loop.
+The implementer makes its changes and **commits**. Pre-commit hooks run automatically — type-check, lint, tests. If a hook fails, the implementer sees the error output and fixes before the commit lands. Once hooks pass, the commit goes onto the feature branch.
+
+The parent agent dispatches step 1, gets a result, dispatches step 2, etc. — making per-turn decisions, not running a loop.
+
+**Why feature branches:** all step commits for a plan live on one branch. The reviewer reads the branch diff. The human can browse it. Merge when approved, revert if needed — one unit.
 
 **Trade-off:** more tmux windows. But each window's job is small enough that a 7B model can do it, and tmux already gives the human visibility into all of them.
 
@@ -94,9 +107,7 @@ The parent agent dispatches step 1, gets a result, dispatches step 2, etc. - mak
 
 The pattern: project rules (in AGENTS.md, loaded by pi) + the step text (passed as the task) + nothing else in the system prompt. Agent instructions stay terse - "implement this step, then stop."
 
-### 5. (Optional) Round out the workflow with a reviewer
 
-The reviewer agent completes the plan → implement → review loop. It has fresh eyes, the spec loaded, and access to external tools. This is where soft signals enter — but anchored against the plan's acceptance criteria, not vibes.
 
 ## What *not* to add
 
@@ -107,7 +118,7 @@ Things the research suggests against, despite being tempting:
 - **Automated retry loops in fork's code.** The parent agent decides per turn whether to re-dispatch the implementer. Don't hard-code a loop.
 - **Updating the plan file after it's written.** Plans are write-once. If the plan is wrong, replan - make a new file.
 - **More-clever planner prompts.** Per [03-agent-patterns.md](./03-agent-patterns.md), the weak-planner problem isn't fixed by prompt cleverness.
-- **Self-critique loops without external signals.** Per [04-verification.md](./04-verification.md), this lowers quality. The reviewer must run real tools as a foundation, then layer judgment on top.
+- **Self-critique loops without external signals.** Per [04-verification.md](./04-verification.md), this lowers quality. Mechanical checks are handled by pre-commit hooks; the reviewer's job is judgment, not tool-running.
 - **Generalist agents.** The pattern is *specialist* agents with narrow scope, not one capable generalist.
 
 ## A target architecture
@@ -117,21 +128,38 @@ Putting it together, this is roughly what a v2 fork looks like:
 ```
   ┌─────────────┐
   │  planner    │  →  plan.md (numbered steps, write-once)
-  └─────────────┘
+  └─────────────┘  →  git branch plan/<slug>
 
-  parent agent reads plan.md, picks a step, dispatches:
+  parent agent reads plan.md, dispatches one step at a time:
 
-      ┌──────────────┐    ┌──────────────┐
-      │ implementer  │    │   reviewer   │
-      │  (one step)  │    │  (one check) │
-      └──────────────┘    └──────────────┘
+      ┌──────────────┐
+      │ implementer  │  (one step, commits to branch)
+      └──────┬───────┘
+             │
+             ▼
+      pre-commit hooks: type-check, lint, tests
+      (implementer retries on failure)
+             │
+             ▼
+      commit lands on plan/<slug>
+             │
+      ... repeat for each step ...
+             │
+             ▼
+      ┌──────────────┐
+      │   reviewer   │  (reads branch diff, judgment only)
+      └──────┬───────┘
+             │
+             ▼
+      verdict: pass → merge branch
+              changes-needed → re-dispatch implementer
 
   results come back via fork-result notifications.
   parent agent takes a new turn, decides what to dispatch next.
   human watches via tmux, intervenes if needed.
 ```
 
-Each box is a tmux window. The plan is a write-once file. The human sees everything via tmux.
+Each box is a tmux window. The plan is a write-once file. The feature branch holds all verified step commits. The human sees everything via tmux.
 
 This is what the research converges on, mapped onto the building blocks you already have, kept as simple as possible.
 

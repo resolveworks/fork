@@ -21,6 +21,8 @@ The principle: each layer narrows. A subagent doing step 3 of plan X should only
 
 For small models this isn't optional. Long context degrades output sharply.
 
+The git layer mirrors this: a feature branch per plan (`plan/<slug>`) keeps all step commits organized in one place. The reviewer reads the branch diff; the human can browse it; merge or revert as a unit. Without a branch, step commits scatter across the log and the plan's full diff is harder to reconstruct.
+
 (Some workflows insert a separate feature-spec layer between project rules and plan. For most setups the plan's goal section is enough; see [02-specs-and-planning.md](./02-specs-and-planning.md).)
 
 ## AGENTS.md (the project-level layer)

@@ -37,7 +37,9 @@ Even without constrained decoding, schemas serve as design contracts:
 
 - The plan format is a schema (sections, checklist items)
 - The implementer's output (diffs) has a schema (file path + content)
-- The reviewer's output has a schema (pass/fail + errors)
+- The reviewer's output has a schema (`verdict: pass | changes-needed` + issues list with file:line references)
+
+The reviewer's structured verdict is a good example: the parent agent parses it to decide whether to proceed or re-dispatch. If the verdict were free-form prose, a derpy parent model would misinterpret it. The schema makes the decision mechanical.
 
 The agent doesn't need fancy decoding to benefit — just clear formats with examples. With a small model, *include the schema and an example in the prompt*. Don't trust the model to invent the format.
 

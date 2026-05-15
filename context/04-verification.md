@@ -49,17 +49,27 @@ The fix is not "use a smarter model for review" — it is **external verificatio
 
 The CRITIC framework (2023) made this explicit: have the LLM generate a response, then use *external tools* (Python interpreter, search, classifier) to verify factual claims, code, or safety. The verification is mechanical, not LLM-driven.
 
-## Building a reviewer for coding work
+## Two layers: hooks + reviewer
 
-Concrete external signals for code:
+The mechanical checks and the judgment review are best handled by different mechanisms, at different points in the workflow.
 
-1. **Compile / type-check.** Cheapest and highest signal. Run on every diff.
-2. **Tests.** The plan should generate or include the tests. Failures feed back as text.
-3. **Lint.** Catches style drift and some classes of bugs.
-4. **Run the code.** For scripts, just run it. For services, hit the endpoint.
-5. **Diff against spec.** A reviewer agent reads the diff *with the spec loaded* and checks acceptance criteria. This is where soft signals enter — but they're anchored against a written spec, not vibes.
+### Layer 1: Pre-commit hooks (per step)
 
-Layer them. Compile first (instant). Lint next (fast). Tests (slower). Reviewer agent last (slowest, most context).
+Compile / type-check, lint, and tests run automatically as git pre-commit hooks. The implementer makes its changes and commits; the hook runs; if it fails, the implementer sees the error output and fixes before the commit lands. No extra subagent, no parent-agent decision point.
+
+This means the cheapest, highest-signal checks happen **at commit time, automatically, on every step.** The implementer doesn't need to be told to run them — the commit itself enforces them.
+
+### Layer 2: Reviewer agent (per plan)
+
+Once all steps have committed (hooks passing), a reviewer agent reads the full plan diff with the spec loaded. This is where soft signals enter — but they're anchored against a written spec, not vibes.
+
+The reviewer's job is **judgment only**. Hooks already caught type errors, lint violations, and test failures. The reviewer brings fresh eyes for things hooks can't check:
+
+- Design issues: is this the right approach?
+- Intent mismatch: does the implementation match the plan's acceptance criteria?
+- Edge cases: what breaks at the boundaries?
+- Security: anything exposed that shouldn't be?
+- Consistency: does this fit with the rest of the codebase?
 
 ## When LLM-as-reviewer actually works
 
@@ -95,18 +105,25 @@ The cost-benefit is good. Small models are cheap to run, so iteration is cheap. 
 
 The benchmark result that matters: "Well-orchestrated small models can match or exceed larger single-agent baselines, with performance driven primarily by the capacity of the Orchestrator rather than the size of execution sub-agents." For fork, the "orchestrator" is just the parent agent making per-turn decisions — that agent's quality is what determines whether the review pattern lifts results.
 
-## Concrete shape (per chunk)
+## Concrete shape (per plan)
 
 The reviewer's job, on one dispatch:
 
-1. Read the diff (or apply it and inspect)
-2. Run type-check / lint / tests as shell commands
-3. Read the code with fresh eyes — check for design issues, mismatch with intent, missed edge cases
-4. Report: pass, or the specific failures (mechanical and judgment-based)
+1. Read the plan and its acceptance criteria
+2. Read the full diff (all steps on the feature branch)
+3. Read the code with fresh eyes — design issues, mismatch with intent, missed edge cases
+4. Report a **structured verdict**:
 
-That's it — one pass, one report. The parent agent (or human) decides whether to re-dispatch the implementer with the errors, accept the diff anyway, or give up. The reviewer itself doesn't loop.
+```
+verdict: pass | changes-needed
+issues:
+  - src/auth.ts:42 — `parseEmail` doesn't handle null input, will throw at runtime
+  - src/auth.ts:58 — missing error response for invalid email, returns 200 silently
+```
 
-The point: most failures get caught by shell commands (type-check, lint, tests). Those are non-LLM, fast, and cheap. The reviewer is mostly a wrapper around running them and aggregating output — but it also brings fresh eyes, which mechanical checks alone miss.
+`pass` → parent merges the branch. `changes-needed` → parent re-dispatches the implementer with the issues as the task. The reviewer itself doesn't loop — it reports once, the parent decides.
+
+The key shift: the reviewer doesn't run linters or tests. Pre-commit hooks already caught mechanical failures on every step. The reviewer is a judgment layer on top, catching the things tools miss — and its output is structured so the parent agent can act on it without interpreting free-form prose.
 
 ## See also
 

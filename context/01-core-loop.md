@@ -41,10 +41,10 @@ The implementer never sees the other steps or the full plan history. Just its st
 
 ### 3. Verify — close the loop
 
-Two layers:
+Two layers, at different points in the workflow:
 
-- **Hard signals**: tests, type-check, lint, build. These are the ground truth. The agent runs them and feeds failures back.
-- **Soft signals**: a separate reviewer agent reads the diff against the step's acceptance criterion. Useful, but only as a complement — never the sole check (see [04-verification.md](./04-verification.md)).
+- **Hard signals (per step)**: type-check, lint, tests run as git pre-commit hooks. The implementer commits; the hook fails or passes. Failures are visible immediately and fixed before the commit lands. No extra agent dispatch needed.
+- **Soft signals (per plan)**: a separate reviewer agent reads the full plan diff against the acceptance criteria. It exercises judgment — design issues, intent mismatch, edge cases — but doesn't re-run the mechanical checks the hooks already passed. It reports a structured verdict: `pass` or `changes-needed` with specific issues. See [04-verification.md](./04-verification.md).
 
 If verify fails: the parent agent decides what to do — re-dispatch the implementer with the failure text, dispatch a different step, or hand it to the human. No automatic loop. If a step keeps failing across attempts: the plan was probably wrong — replan.
 
