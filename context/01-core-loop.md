@@ -24,7 +24,7 @@ A human-and-model collaboration that ends in a plan file. The plan is the artifa
 - Each step names files, gives a one-line change, and has an acceptance criterion
 - Risks / things to watch for
 
-The plan file is **read-only data** once written. State (which step is in progress, how many times it's been retried) lives outside the file. See [02-specs-and-planning.md](./02-specs-and-planning.md) for the shape.
+The plan file is **read-only data** once written. The parent agent reads it and decides per turn which step to dispatch next. Nothing tracks "where we are" — each dispatch is a discrete event. See [02-specs-and-planning.md](./02-specs-and-planning.md) for the shape.
 
 Key property: each step should fit in a single small-model context window without needing the rest of the codebase loaded.
 
@@ -46,7 +46,7 @@ Two layers:
 - **Hard signals**: tests, type-check, lint, build. These are the ground truth. The agent runs them and feeds failures back.
 - **Soft signals**: a separate reviewer agent reads the diff against the step's acceptance criterion. Useful, but only as a complement — never the sole verifier (see [04-verification.md](./04-verification.md)).
 
-If verify fails: revise the chunk (cap retries). If verify keeps failing past the cap: surface to the human. If a step keeps failing across humans: the plan was wrong — replan.
+If verify fails: the parent agent decides what to do — re-dispatch the implementer with the failure text, dispatch a different step, or hand it to the human. No automatic loop. If a step keeps failing across attempts: the plan was probably wrong — replan.
 
 ## Why this works for derpy models
 
@@ -69,7 +69,7 @@ It replaces the dominant 2023-era pattern of "tell the agent the whole goal and 
 
 - **No plan, just chunks.** Chunks without a plan produce locally-correct but globally-inconsistent code.
 - **One mega-chunk.** "Implement the whole feature" — produces the inconsistency and duplication mentioned above.
-- **State in the plan file.** Plans should be read-only data. Tracking which steps are done belongs in the orchestrator (or, for fork, in tmux visibility).
+- **State in the plan file.** Plans should be read-only data. There's no need to track "which step is in progress" — the parent agent picks a step, dispatches, and the result is the result.
 - **Self-verification only.** Asking the same model "is this right?" tends to *decrease* accuracy without external signals.
 - **Loading the whole codebase each chunk.** Long context degrades small-model output substantially. Load surgically.
 

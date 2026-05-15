@@ -16,10 +16,10 @@ An ordered list of *implementable steps*. Each step:
 The plan is a **file**, not transient prompt text. File-ness unlocks:
 
 - Human edits before execution
-- Re-reading by the implementer on each step (no need to re-derive)
+- Re-reading on each dispatch (no need to re-derive)
 - Resumability across sessions
 
-The file does **not** need to track state (which steps are done, which failed). State lives outside the file — in the orchestrator, in commits, or for fork, in tmux visibility of the running agents. Keeping the plan file pure data rather than data+state means the model has less to parse and no state to accidentally modify.
+The plan does **not** track anything. It's read-only data — a list of steps. The parent agent reads it, picks a step, dispatches the implementer. There's no "current step", no "done marker", no retry counter anywhere.
 
 ## Plan format
 
@@ -42,7 +42,7 @@ Simple. Numbered list of steps. No frontmatter, no checkboxes, no status markers
 <things to watch for>
 ```
 
-The orchestrator passes step N's text to the implementer. The implementer doesn't see the other steps. The plan is iterable from the outside, not "self-tracking" from the inside.
+The parent agent passes step N's text to the implementer. The implementer doesn't see the other steps. The plan is read from the outside, never written.
 
 ## What makes plans fail
 

@@ -13,7 +13,7 @@ The pattern that has won is **plan → small chunks → verify**, with each step
 Six concrete levers in order of impact:
 
 1. **Narrow the task.** One function, one chunk, one plan step — not "implement the feature."
-2. **Externalize the plan as a file.** Plans are artifacts the human can edit and the agent re-reads, not transient prompt text. Keep them read-only data; track state outside the file.
+2. **Externalize the plan as a file.** Plans are artifacts the human can edit and agents re-read, not transient prompt text. Keep them read-only — the parent agent picks which step to dispatch next, the plan itself doesn't need to remember anything.
 3. **Verify with external signals.** Tests, type-checks, linters > self-critique. A 2023 result still holds: pure self-review *lowers* accuracy.
 4. **Use schemas to pin reliability.** Constrained decoding makes a 7B model emit valid JSON 99% of the time. Reliability ≠ smartness.
 5. **Engineer the context.** AGENTS.md / CLAUDE.md at the repo root carries project rules. Each subagent call gets only project rules + the one step + named files.

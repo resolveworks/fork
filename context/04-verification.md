@@ -79,39 +79,33 @@ From the agent-loops literature, three patterns to watch:
 
 2. **Underspecified tasks.** If there's no clear notion of "better," refinement has nowhere to go. Mitigated by acceptance criteria in the plan / spec.
 
-3. **Error amplification.** Iterations compound mistakes — the generator latches onto a wrong direction and the verifier rationalizes it. Mitigated by capping iterations and falling back to human review.
+3. **Error amplification.** Repeated revise attempts compound mistakes — the generator latches onto a wrong direction and the verifier rationalizes it. Mitigated by stopping after a couple of attempts and falling back to human review.
 
-## Loop budgeting
+## Knowing when to stop
 
-A practical structure:
+A revise-on-failure dance can compound mistakes if it goes on too long. The practical guidance:
 
-- Max 3 revise iterations per chunk
-- Each iteration uses the previous feedback verbatim
-- If still failing after 3, surface to the human and stop
-- The orchestrator owns the iteration count; nothing is persisted to the plan file
+- After 2–3 unsuccessful revise attempts, stop and hand the problem to the human
+- Each attempt should include the previous failure text verbatim — don't paraphrase it
+- If the same kind of failure keeps appearing, the plan step was probably wrong; replan rather than retry
 
 ## What verifying buys you with small models
 
 The cost-benefit is good. Small models are cheap to run, so iteration is cheap. The verifier catches the exact failure modes small models are prone to (hallucinated APIs, wrong imports, missed edge cases) using cheap external signals. The combination — cheap generator + cheap external verifier — has been shown to match much larger single-model setups on schema-bounded tasks.
 
-The benchmark result that matters: "Well-orchestrated small models can match or exceed larger single-agent baselines, with performance driven primarily by the capacity of the Orchestrator rather than the size of execution sub-agents." The orchestrator is *what runs the verify loop*.
+The benchmark result that matters: "Well-orchestrated small models can match or exceed larger single-agent baselines, with performance driven primarily by the capacity of the Orchestrator rather than the size of execution sub-agents." For fork, the "orchestrator" is just the parent agent making per-turn decisions — that agent's quality is what determines whether the verify pattern lifts results.
 
-## Concrete recipe
+## Concrete shape (per chunk)
 
-For a coding chunk:
+The verifier's job, on one dispatch:
 
-```
-1. implementer generates a diff
-2. apply diff
-3. run type-checker; if fails → feed errors back to implementer, goto 1 (count++)
-4. run linter; if fails → feed errors back, goto 1 (count++)
-5. run tests; if fails → feed test output back, goto 1 (count++)
-6. if count > 3 → mark blocked, surface to human
-7. (optional) reviewer agent reads diff + spec; if criticism → revise once more
-8. commit
-```
+1. Read the diff (or apply it and inspect)
+2. Run type-check / lint / tests as shell commands
+3. Report: pass, or the specific errors
 
-Steps 3–5 are non-LLM. They're shell commands. Most failures get caught there without needing a reviewer.
+That's it — one pass, one report. The parent agent (or human) decides whether to re-dispatch the implementer with the errors, accept the diff anyway, or give up. The verifier itself doesn't loop.
+
+The point: most failures get caught by shell commands (type-check, lint, tests). Those are non-LLM, fast, and cheap. The verifier is mostly a wrapper around running them and aggregating output — not a sophisticated reviewer.
 
 ## See also
 
