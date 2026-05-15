@@ -9,7 +9,6 @@
  * Esc, queued message), the child reports `takenOver` and stays alive
  * as a normal interactive pi.
  *
- * Commands:  /agents  /kill-agent
  * Tool:      subagent { agent, task }
  *
  * Requires: run pi inside tmux.
@@ -48,92 +47,54 @@ const TASKS_DIR = path.join(ROOT, "tasks");
 const RESULT_TYPE = "fork-result";
 const SEEN_TTL_MS = 10 * 60 * 1000;
 
-// ── state (ephemeral JSON in /tmp) ──────────────────────────────────
-
-interface AgentEntry {
-	id: string;
-	name: string;
-	task: string;
-	window: string; // tmux window index
-	parentSessionId: string;
-	started: number;
-}
-
-function statePath(session: string): string {
-	return path.join(os.tmpdir(), `pi-agents-${session}.json`);
-}
-
-function loadAgents(session: string): AgentEntry[] {
-	try {
-		return JSON.parse(fs.readFileSync(statePath(session), "utf-8"));
-	} catch {
-		return [];
-	}
-}
-
-function saveAgents(session: string, agents: AgentEntry[]): void {
-	fs.writeFileSync(statePath(session), JSON.stringify(agents, null, 2));
-}
-
-/** Remove entries whose tmux window no longer exists. */
-function pruneStale(session: string, agents: AgentEntry[]): AgentEntry[] {
-	const alive = new Set(
-		tmux(`list-windows -t ${session} -F '#I'`)
-			.split("\n")
-			.filter(Boolean),
-	);
-	return agents.filter((a) => alive.has(a.window));
-}
-
-// ── agent discovery (frontmatter .md files) ─────────────────────────
+// ── hardcoded agents ────────────────────────────────────────────────
 
 interface AgentConfig {
 	name: string;
 	description: string;
-	tools?: string[];
+	tools: string[];
 	prompt: string;
 }
 
-function discoverAgents(): AgentConfig[] {
-	const agents: AgentConfig[] = [];
-	const dirs = [
-		path.join(os.homedir(), ".pi", "agent", "agents"),
-		".pi/agents",
-		"agents", // local repo (./agents/)
-	];
-
-	for (const dir of dirs) {
-		if (!fs.existsSync(dir)) continue;
-		try {
-			for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-				if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
-				const raw = fs.readFileSync(path.join(dir, entry.name), "utf-8");
-				const m = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
-				if (!m) continue;
-
-				const fm: Record<string, string> = {};
-				for (const line of m[1].split("\n")) {
-					const i = line.indexOf(":");
-					if (i > 0) fm[line.slice(0, i).trim()] = line.slice(i + 1).trim();
-				}
-				if (!fm.name || !fm.description) continue;
-
-				agents.push({
-					name: fm.name,
-					description: fm.description,
-					tools: fm.tools
-						?.split(",")
-						.map((t) => t.trim())
-						.filter(Boolean),
-					prompt: m[2].trim(),
-				});
-			}
-		} catch {
-			/* skip unreadable dirs */
-		}
-	}
-	return agents;
-}
+const AGENTS: AgentConfig[] = [
+	{
+		name: "planner",
+		description: "Creates implementation plans from context and requirements (read-only)",
+		tools: ["read", "grep", "find", "ls"],
+		prompt:
+			`You are a planning specialist. You receive context and requirements, then produce a clear implementation plan.\n\n` +
+			`You must NOT make any changes. Only read, analyze, and plan.\n\n` +
+			`Output format:\n\n` +
+			`## Goal\n` +
+			`One sentence summary of what needs to be done.\n\n` +
+			`## Plan\n` +
+			`Numbered steps, each small and actionable:\n` +
+			`1. Step one - specific file/function to modify\n` +
+			`2. Step two - what to add/change\n` +
+			`...\n\n` +
+			`## Files to Modify\n` +
+			`- path/to/file.ts - what changes\n\n` +
+			`## New Files (if any)\n` +
+			`- path/to/new.ts - purpose\n\n` +
+			`## Risks\n` +
+			`Anything to watch out for.`,
+	},
+	{
+		name: "implementer",
+		description: "Executes implementation plans by making concrete code changes",
+		tools: [],
+		prompt:
+			`You are an implementation specialist. You execute plans by making concrete code changes.\n\n` +
+			`Work autonomously. Use all available tools as needed.\n\n` +
+			`Output format when finished:\n\n` +
+			`## Completed\n` +
+			`What was done.\n\n` +
+			`## Files Changed\n` +
+			`- path/to/file.ts - what changed\n\n` +
+			`## Notes (if any)\n` +
+			`Anything the main agent should know.`,
+	},
+];
 
 // ── result-file helpers (used by both roles) ────────────────────────
 
@@ -272,9 +233,6 @@ function setupParent(pi: ExtensionAPI): void {
 
 	const session = tmux("display-message -p '#S'");
 
-	let agents = pruneStale(session, loadAgents(session));
-	saveAgents(session, agents);
-
 	// ── result watcher (single instance across reloads via globalThis) ──
 
 	const seen = ((globalThis as any).__fork_seen ??= new Map<string, { ts: number; takenOver: boolean }>());
@@ -323,10 +281,6 @@ function setupParent(pi: ExtensionAPI): void {
 			try { tmux(`kill-window -t ${session}:${data.tmuxWindow}`); } catch {}
 		}
 
-		// Drop the spawn record from /tmp state too.
-		agents = loadAgents(session).filter((a) => a.id !== data.id);
-		saveAgents(session, agents);
-
 		unlinkSpawnArtifacts(data.id);
 	};
 
@@ -365,26 +319,20 @@ function setupParent(pi: ExtensionAPI): void {
 			"Spawn a subagent as a separate interactive pi session in a new tmux window. " +
 			"Returns immediately. Findings are delivered to this session as a follow-up " +
 			"message when the subagent finishes. If the user takes over the subagent's " +
-			"tmux window (typing, Esc, queued message), no findings are returned. " +
-			"Use /agents to list, /kill-agent <name> to stop.",
+			"tmux window (typing, Esc, queued message), no findings are returned.",
 		parameters: Type.Object({
 			agent: Type.String({
 				description:
 					"Agent name. Available: " +
-					discoverAgents()
-						.map((a) => `${a.name} — ${a.description}`)
-						.join("; "),
+					AGENTS.map((a) => `${a.name} — ${a.description}`).join("; "),
 			}),
 			task: Type.String({ description: "Task for the subagent" }),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const allAgents = discoverAgents();
-			const cfg = allAgents.find((a) => a.name === params.agent);
+			const cfg = AGENTS.find((a) => a.name === params.agent);
 
 			if (!cfg) {
-				const list =
-					allAgents.map((a) => `  ${a.name}: ${a.description}`).join("\n") ||
-					"  (none found)";
+				const list = AGENTS.map((a) => `  ${a.name}: ${a.description}`).join("\n");
 				return {
 					content: [
 						{
@@ -428,17 +376,6 @@ function setupParent(pi: ExtensionAPI): void {
 				`send-keys -t ${session}:${win} ${JSON.stringify(cmd.join(" "))} Enter`,
 			);
 
-			agents = loadAgents(session);
-			agents.push({
-				id,
-				name: cfg.name,
-				task: params.task,
-				window: win,
-				parentSessionId: currentSessionId ?? "",
-				started: Date.now(),
-			});
-			saveAgents(session, agents);
-
 			return {
 				content: [
 					{
@@ -449,73 +386,12 @@ function setupParent(pi: ExtensionAPI): void {
 			};
 		},
 	});
-
-	// ── commands ──
-
-	pi.registerCommand("agents", {
-		description: "List running subagents",
-		handler: async (_args, ctx) => {
-			agents = pruneStale(session, loadAgents(session));
-			saveAgents(session, agents);
-			if (agents.length === 0) {
-				ctx.ui.notify("No subagents running.", "info");
-				return;
-			}
-			const lines = agents.map(
-				(a) => `  ${a.name} (win ${a.window}): ${a.task.slice(0, 60)}`,
-			);
-			ctx.ui.notify(`Subagents:\n${lines.join("\n")}`, "info");
-		},
-	});
-
-	pi.registerCommand("kill-agent", {
-		description: "Kill a subagent window",
-		handler: async (args, ctx) => {
-			agents = pruneStale(session, loadAgents(session));
-
-			let target: AgentEntry | undefined;
-			if (args) {
-				target = agents.find((a) => a.name === args || a.id === args);
-			} else if (agents.length > 0) {
-				const choices = agents.map(
-					(a) => `${a.name} (win ${a.window}): ${a.task.slice(0, 40)}`,
-				);
-				const pick = await ctx.ui.select("Kill:", choices);
-				if (pick) target = agents[choices.indexOf(pick)];
-			}
-
-			if (!target) {
-				ctx.ui.notify("No agent to kill.", "error");
-				return;
-			}
-
-			try {
-				tmux(`kill-window -t ${session}:${target.window}`);
-			} catch {
-				/* already gone */
-			}
-			// Remove any pending result file so the parent doesn't get a phantom
-			// notification later.
-			unlinkSpawnArtifacts(target.id);
-			agents = agents.filter((a) => a.id !== target!.id);
-			saveAgents(session, agents);
-			ctx.ui.notify(`Killed ${target.name}`, "info");
-		},
-	});
 }
 
 // ── extension entry ─────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	if (!inTmux()) {
-		pi.registerCommand("agents", {
-			description: "Subagent management (requires tmux)",
-			handler: async (_args, ctx) => {
-				ctx.ui.notify("Run pi inside tmux to use fork.", "warn");
-			},
-		});
-		return;
-	}
+	if (!inTmux()) return;
 
 	if (isSubagent()) {
 		setupChild(pi);
