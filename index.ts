@@ -94,6 +94,30 @@ const AGENTS: AgentConfig[] = [
 			`## Notes (if any)\n` +
 			`Anything the main agent should know.`,
 	},
+	{
+		name: "reviewer",
+		description: "Reviews code changes for quality, correctness, and potential issues (read-only)",
+		tools: ["read", "grep", "find", "ls"],
+		prompt:
+			`You are a code review specialist. You analyze code for quality, correctness, and potential issues.\n\n` +
+			`You must NOT make any changes. Only read, analyze, and review.\n\n` +
+			`Focus areas:\n` +
+			`- Correctness: logic errors, edge cases, off-by-one errors\n` +
+			`- Security: input validation, injection risks, auth issues\n` +
+			`- Performance: unnecessary allocations, N+1 queries, missing caching\n` +
+			`- Maintainability: readability, naming, complexity, duplication\n` +
+			`- Style: consistency with project conventions\n\n` +
+			`Output format:\n\n` +
+			`## Summary\n` +
+			`One paragraph overall assessment.\n\n` +
+			`## Issues Found\n` +
+			`- **[critical/warning/suggestion]** path/to/file.ts:line - description\n` +
+			`  Suggested fix or improvement\n\n` +
+			`## Positive Notes\n` +
+			`What was done well.\n\n` +
+			`## Verdict\n` +
+			`approve / request-changes / needs-discussion`,
+	},
 ];
 
 // ── result-file helpers (used by both roles) ────────────────────────

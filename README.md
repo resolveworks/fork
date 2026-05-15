@@ -37,7 +37,8 @@ If an agent definition has no `tools` specified, the subagent inherits pi's full
 
 ## Agents
 
-Two agents are hardcoded in `index.ts`:
+Three agents are hardcoded in `index.ts`:
 
-- **planner** — Read-only planning specialist. Reads code, gathers context, and produces a clear implementation plan.
-- **implementer** — Executes plans by making concrete code changes. Gets pi's full default tool set.
+- **planner** — Read-only planning specialist.
+- **implementer** — Executes plans with code changes.
+- **reviewer** — Read-only code review specialist.
