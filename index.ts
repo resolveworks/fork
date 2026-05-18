@@ -8,7 +8,7 @@
  * Children are spawned as separate `pi` processes in new tmux windows.
  * The parent's tool call returns immediately; results are delivered
  * back as a `fork-result` notification message that triggers a new
- * turn. Subagents call the `done` tool when finished.
+ * turn. Each agent has its own completion tool: `implement`, `commit`, or `review`.
  *
  * Requires: run pi inside tmux.
  */
@@ -19,11 +19,9 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type, type TSchema } from "typebox";
+import { type TSchema, Type } from "typebox";
 
 // ── tmux ────────────────────────────────────────────────────────────
-
-
 
 function inTmux(): boolean {
 	return !!process.env.TMUX;
@@ -85,7 +83,7 @@ abstract class SubAgent<P> {
 			name: this.name,
 			label: this.name.charAt(0).toUpperCase() + this.name.slice(1),
 			description: this.description,
-			parameters: this.params as any,
+			parameters: this.params as TSchema,
 			execute: async (_id, params, _signal, _onUpdate, ctx) =>
 				dispatcher.spawn(this, params as P, ctx.cwd),
 		});
@@ -97,7 +95,7 @@ abstract class SubAgent<P> {
 			systemPrompt: this.systemPrompt(),
 		}));
 		if (this.tools.length > 0) {
-			pi.setActiveTools([...this.tools, "done"]);
+			pi.setActiveTools([...this.tools]);
 		}
 	}
 }
@@ -106,9 +104,7 @@ abstract class SubAgent<P> {
 
 const READ_ONLY = ["read", "grep", "find", "ls"] as const;
 
-class PlanAgent extends SubAgent<
-	{ goal: string; slug: string }
-> {
+class PlanAgent extends SubAgent<{ goal: string; slug: string }> {
 	readonly name = "plan";
 	readonly description =
 		"Create an implementation plan. Reads the codebase and writes plans/<slug>/plan.md + step files.";
@@ -160,7 +156,7 @@ class PlanAgent extends SubAgent<
 			"('test X passes', 'command outputs Y') — not internal state ('added a struct').",
 			"Keep each step to one meaningful commit.",
 			"",
-			"When done, call `done`.",
+			"When done, call `implement`.",
 		].join("\n");
 	}
 
@@ -169,9 +165,7 @@ class PlanAgent extends SubAgent<
 	}
 }
 
-class ImplementAgent extends SubAgent<
-	{ plan: string; step: number }
-> {
+class ImplementAgent extends SubAgent<{ plan: string; step: number }> {
 	readonly name = "implement";
 	readonly description =
 		"Implement a single step from a plan. Commits on the current branch.";
@@ -188,10 +182,9 @@ class ImplementAgent extends SubAgent<
 			"plan — not more.",
 			"",
 			"- Implement only the step described in the task.",
-			"- Commit when done. Pre-commit hooks (type-check, lint, tests) must pass.",
+			"- Call `commit` when done with a one-line summary of what changed.",
+			"  Pre-commit hooks (type-check, lint, tests) must pass.",
 			"  If a hook fails, fix the underlying issue and re-commit — don't bypass.",
-			"- Output a one-line summary of what changed.",
-			"- When done, call `done`.",
 		].join("\n");
 	}
 
@@ -226,13 +219,11 @@ interface ReviewIssue {
 	issue: string;
 }
 
-class ReviewAgent extends SubAgent<
-	{ plan: string; step: number }
-> {
+class ReviewAgent extends SubAgent<{ plan: string; step: number }> {
 	readonly name = "review";
 	readonly description =
 		"Read-only code review specialist. Reads plan/step files and reviews the latest commit against the step's acceptance criteria.";
-	readonly tools = [...READ_ONLY, "bash", "write_review"] as const;
+	readonly tools = [...READ_ONLY, "bash"] as const;
 	readonly params = Type.Object({
 		plan: Type.String({ description: "Plan slug (e.g. dark-mode)" }),
 		step: Type.Number({ description: "Step number to review" }),
@@ -249,14 +240,11 @@ class ReviewAgent extends SubAgent<
 			"",
 			"Use `bash` for `git show HEAD` and `git diff` only.",
 			"",
-			"When done, call `write_review` with your verdict and issues, then call `done`.",
+			"When done, call `review` with your verdict and issues.",
 		].join("\n");
 	}
 
-	formatTask({
-		plan,
-		step,
-	}: { plan: string; step: number }): string {
+	formatTask({ plan, step }: { plan: string; step: number }): string {
 		const padded = String(step).padStart(3, "0");
 		const dir = planDirFor(plan);
 		const planPath = path.join(dir, "plan.md");
@@ -282,15 +270,14 @@ class ReviewAgent extends SubAgent<
 			"",
 			"Inspect the diff with `git show HEAD`.",
 			"Judge whether the commit meets the step's intent and acceptance.",
-			"Call `write_review` with your verdict and any issues.",
-			"Then call `done`.",
+			"Call `review` with your verdict and any issues.",
 		].join("\n");
 	}
 }
 
 // ── registry ────────────────────────────────────────────────────────
 
-const agents: SubAgent<any>[] = [
+const agents: SubAgent<Record<string, unknown>>[] = [
 	new PlanAgent(),
 	new ImplementAgent(),
 	new ReviewAgent(),
@@ -300,13 +287,24 @@ const agentByName = new Map(agents.map((a) => [a.name, a]));
 // ── parent: dispatcher ──────────────────────────────────────────────
 
 class Dispatcher {
-	private active = new Map<string, { agent: SubAgent<any>; params: any; tmuxWindow: string; cwd: string }>();
+	private active = new Map<
+		string,
+		{
+			agent: SubAgent<Record<string, unknown>>;
+			params: Record<string, unknown>;
+			tmuxWindow: string;
+			cwd: string;
+		}
+	>();
 	private pipeline: PipelineState | null = null;
 	private session: string;
 	private currentSessionId: string | null = null;
 
 	constructor(private pi: ExtensionAPI) {
-		this.session = execSync("tmux display-message -p '#S'", { encoding: "utf-8", timeout: 3000 }).trim();
+		this.session = execSync("tmux display-message -p '#S'", {
+			encoding: "utf-8",
+			timeout: 3000,
+		}).trim();
 	}
 
 	setSessionId(id: string): void {
@@ -331,7 +329,10 @@ class Dispatcher {
 			`tmux new-window -t ${this.session} -n ${id} -c ${cwd} -P -F '#I'`,
 			{ encoding: "utf-8", timeout: 3000 },
 		).trim();
-		execSync(`tmux set-option -t ${this.session}:${win} -w remain-on-exit off`, { encoding: "utf-8", timeout: 3000 });
+		execSync(
+			`tmux set-option -t ${this.session}:${win} -w remain-on-exit off`,
+			{ encoding: "utf-8", timeout: 3000 },
+		);
 
 		const cmdParts = [
 			"pi",
@@ -347,7 +348,10 @@ class Dispatcher {
 		}
 		cmdParts.push(`@${taskPath}`);
 		const cmd = cmdParts.join(" ");
-		execSync(`tmux send-keys -t ${this.session}:${win} ${JSON.stringify(cmd)} Enter`, { encoding: "utf-8", timeout: 3000 });
+		execSync(
+			`tmux send-keys -t ${this.session}:${win} ${JSON.stringify(cmd)} Enter`,
+			{ encoding: "utf-8", timeout: 3000 },
+		);
 
 		this.active.set(id, { agent, params, tmuxWindow: win, cwd });
 
@@ -363,26 +367,38 @@ class Dispatcher {
 
 	deliverResult(payload: ResultPayload): void {
 		const slot = this.active.get(payload.id);
-		if (!slot) throw new Error(`fork: deliverResult called for unknown agent ${payload.id}`);
+		if (!slot)
+			throw new Error(
+				`fork: deliverResult called for unknown agent ${payload.id}`,
+			);
 
 		this.active.delete(payload.id);
-		execSync(`tmux kill-window -t ${this.session}:${slot.tmuxWindow}`, { encoding: "utf-8", timeout: 3000 });
+		execSync(`tmux kill-window -t ${this.session}:${slot.tmuxWindow}`, {
+			encoding: "utf-8",
+			timeout: 3000,
+		});
 		fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
 
 		if (slot.agent instanceof PlanAgent) {
 			this.startPipeline(slot.params as { slug: string }, slot.cwd);
 		} else if (slot.agent instanceof ImplementAgent) {
-			this.handleImplementComplete(slot.params as { plan: string; step: number });
+			this.handleImplementComplete(
+				slot.params as { plan: string; step: number },
+			);
 		} else if (slot.agent instanceof ReviewAgent) {
 			const { verdict } = payload as ReviewResultPayload;
-			this.handleReviewComplete(slot.params as { plan: string; step: number }, verdict);
+			this.handleReviewComplete(
+				slot.params as { plan: string; step: number },
+				verdict,
+			);
 		}
 	}
 
 	private startPipeline(params: { slug: string }, cwd: string): void {
 		const { slug } = params;
 		const planDir = planDirFor(slug);
-		const stepFiles = fs.readdirSync(planDir)
+		const stepFiles = fs
+			.readdirSync(planDir)
 			.filter((f) => f.match(/^step-\d{3}\.md$/))
 			.sort();
 
@@ -401,26 +417,46 @@ class Dispatcher {
 
 		this.notify(`Implementing step ${currentStep}/${totalSteps}...`);
 
-		const implementAgent = agentByName.get("implement")!;
-		this.spawn(implementAgent, { plan: slug, step: currentStep }, this.pipeline.cwd);
+		const implementAgent = agentByName.get("implement");
+		if (!implementAgent)
+			throw new Error("fork: implement agent not found in registry");
+		this.spawn(
+			implementAgent,
+			{ plan: slug, step: currentStep },
+			this.pipeline.cwd,
+		);
 	}
 
-	private handleImplementComplete(params: { plan: string; step: number }): void {
+	private handleImplementComplete(params: {
+		plan: string;
+		step: number;
+	}): void {
 		if (!this.pipeline) throw new Error("fork: no active pipeline");
 
 		this.notify(`Step ${params.step} implemented. Reviewing...`);
 
-		const reviewAgent = agentByName.get("review")!;
-		this.spawn(reviewAgent, { plan: params.plan, step: params.step }, this.pipeline.cwd);
+		const reviewAgent = agentByName.get("review");
+		if (!reviewAgent)
+			throw new Error("fork: review agent not found in registry");
+		this.spawn(
+			reviewAgent,
+			{ plan: params.plan, step: params.step },
+			this.pipeline.cwd,
+		);
 	}
 
-	private handleReviewComplete(params: { plan: string; step: number }, verdict: "pass" | "changes-needed"): void {
+	private handleReviewComplete(
+		params: { plan: string; step: number },
+		verdict: "pass" | "changes-needed",
+	): void {
 		if (!this.pipeline) throw new Error("fork: no active pipeline");
 
 		if (verdict === "pass") {
 			this.pipeline.currentStep++;
 			if (this.pipeline.currentStep > this.pipeline.totalSteps) {
-				this.notify(`All ${this.pipeline.totalSteps} steps implemented and reviewed.`);
+				this.notify(
+					`All ${this.pipeline.totalSteps} steps implemented and reviewed.`,
+				);
 				this.pipeline = null;
 			} else {
 				this.spawnImplementStep();
@@ -459,8 +495,7 @@ function setupParent(pi: ExtensionAPI): void {
 			socket.setEncoding("utf-8");
 			socket.on("data", (chunk: string) => {
 				buf += chunk;
-				let nl: number;
-				while ((nl = buf.indexOf("\n")) >= 0) {
+				for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
 					const line = buf.slice(0, nl);
 					buf = buf.slice(nl + 1);
 					if (line.length === 0) continue;
@@ -469,8 +504,9 @@ function setupParent(pi: ExtensionAPI): void {
 				}
 			});
 		});
-		server.listen(sockPath, () => {
-			fs.chmodSync(sockPath!, 0o600);
+		const currentSockPath = sockPath;
+		server.listen(currentSockPath, () => {
+			fs.chmodSync(currentSockPath, 0o600);
 		});
 	});
 
@@ -482,15 +518,21 @@ function setupParent(pi: ExtensionAPI): void {
 	});
 
 	// Only expose plan to the LLM; implement and review run mechanically
-	agentByName.get("plan")!.registerTool(pi, dispatcher);
+	const planAgent = agentByName.get("plan");
+	if (!planAgent) throw new Error("fork: plan agent not found in registry");
+	planAgent.registerTool(pi, dispatcher);
 }
 
 // ── child role ──────────────────────────────────────────────────────
 
-function setupChild(pi: ExtensionAPI, agent: SubAgent<any>): void {
+function setupChild(
+	pi: ExtensionAPI,
+	agent: SubAgent<Record<string, unknown>>,
+): void {
 	const id = pi.getFlag("subagent-id") as string | undefined;
 	const socketPath = pi.getFlag("subagent-socket") as string | undefined;
-	if (!id) throw new Error("fork: subagent missing required --subagent-id flag");
+	if (!id)
+		throw new Error("fork: subagent missing required --subagent-id flag");
 	if (!socketPath)
 		throw new Error("fork: subagent missing required --subagent-socket flag");
 
@@ -499,7 +541,10 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any>): void {
 	// Register plan-specific tools for PlanAgent
 	if (agent instanceof PlanAgent) {
 		const slug = pi.getFlag("subagent-plan-slug") as string | undefined;
-		if (!slug) throw new Error("fork: plan agent missing required --subagent-plan-slug flag");
+		if (!slug)
+			throw new Error(
+				"fork: plan agent missing required --subagent-plan-slug flag",
+			);
 
 		const planDir = planDirFor(slug);
 		let stepCounter = 0;
@@ -509,15 +554,23 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any>): void {
 			label: "Write Plan",
 			description: "Write the plan overview file. Can only be called once.",
 			parameters: Type.Object({
-				content: Type.String({ description: "Plan overview content (markdown)" }),
+				content: Type.String({
+					description: "Plan overview content (markdown)",
+				}),
 			}),
 			async execute(_id, params) {
 				if (fs.existsSync(path.join(planDir, "plan.md"))) {
 					throw new Error("write_plan already called — plan.md already exists");
 				}
 				fs.mkdirSync(planDir, { recursive: true });
-				fs.writeFileSync(path.join(planDir, "plan.md"), (params as { content: string }).content, { mode: 0o600 });
-				return { content: [{ type: "text", text: `Wrote ${planDir}/plan.md` }] };
+				fs.writeFileSync(
+					path.join(planDir, "plan.md"),
+					(params as { content: string }).content,
+					{ mode: 0o600 },
+				);
+				return {
+					content: [{ type: "text", text: `Wrote ${planDir}/plan.md` }],
+				};
 			},
 		});
 
@@ -530,27 +583,85 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any>): void {
 			}),
 			async execute(_id, params) {
 				if (!fs.existsSync(planDir)) {
-					throw new Error("write_step called before write_plan — plan directory does not exist");
+					throw new Error(
+						"write_step called before write_plan — plan directory does not exist",
+					);
 				}
 				stepCounter++;
 				const padded = String(stepCounter).padStart(3, "0");
 				const filename = `step-${padded}.md`;
-				fs.writeFileSync(path.join(planDir, filename), (params as { content: string }).content, { mode: 0o600 });
-				return { content: [{ type: "text", text: `Wrote ${planDir}/${filename}` }] };
+				fs.writeFileSync(
+					path.join(planDir, filename),
+					(params as { content: string }).content,
+					{ mode: 0o600 },
+				);
+				return {
+					content: [{ type: "text", text: `Wrote ${planDir}/${filename}` }],
+				};
 			},
 		});
 
-		pi.setActiveTools([...agent.tools, "write_plan", "write_step", "done"]);
+		pi.registerTool({
+			name: "implement",
+			label: "Implement",
+			description:
+				"Report completion to the parent and start implementation. Call when the plan is complete.",
+			parameters: Type.Object({}),
+			async execute(_id, _params, _signal, _onUpdate, ctx) {
+				const socket = net.connect(socketPath);
+				socket.on("error", (err) => {
+					throw err;
+				});
+				socket.end(`${JSON.stringify({ id })}\n`, () => ctx.shutdown());
+				return {
+					content: [
+						{ type: "text", text: "Plan complete. Starting implementation." },
+					],
+				};
+			},
+		});
+
+		pi.setActiveTools([
+			...agent.tools,
+			"write_plan",
+			"write_step",
+			"implement",
+		]);
 	}
 
-	if (agent instanceof ReviewAgent) {
-		let reviewVerdict: "pass" | "changes-needed" | undefined;
-
+	if (agent instanceof ImplementAgent) {
 		pi.registerTool({
-			name: "write_review",
-			label: "Write Review",
+			name: "commit",
+			label: "Commit",
 			description:
-				"Submit your review verdict and issues. Call once when done.",
+				"Stage all changes, commit, and report completion to the parent. " +
+				"Call when your implementation is complete.",
+			parameters: Type.Object({
+				message: Type.String({ description: "Commit message" }),
+			}),
+			async execute(_id, params, _signal, _onUpdate, ctx) {
+				const { message } = params as { message: string };
+				execSync("git add -A", { encoding: "utf-8", timeout: 30000 });
+				execSync(`git commit -m ${JSON.stringify(message)}`, {
+					encoding: "utf-8",
+					timeout: 60000,
+				});
+				const socket = net.connect(socketPath);
+				socket.on("error", (err) => {
+					throw err;
+				});
+				socket.end(`${JSON.stringify({ id })}\n`, () => ctx.shutdown());
+				return { content: [{ type: "text", text: "Committed and done." }] };
+			},
+		});
+		pi.setActiveTools([...agent.tools, "commit"]);
+	} else if (agent instanceof ReviewAgent) {
+		pi.registerTool({
+			name: "review",
+			label: "Review",
+			description:
+				"Submit your review verdict and issues, and report completion to the parent. " +
+				"Call when your review is complete.",
 			parameters: Type.Object({
 				verdict: Type.Union(
 					[Type.Literal("pass"), Type.Literal("changes-needed")],
@@ -565,60 +676,28 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any>): void {
 					{ description: "Issues found (empty if verdict is pass)" },
 				),
 			}),
-			async execute(_id, params) {
+			async execute(_id, params, _signal, _onUpdate, ctx) {
 				const { verdict, issues } = params as {
 					verdict: "pass" | "changes-needed";
 					issues: ReviewIssue[];
 				};
-				reviewVerdict = verdict;
+				const socket = net.connect(socketPath);
+				socket.on("error", (err) => {
+					throw err;
+				});
+				const payload: ReviewResultPayload = { id, verdict };
+				socket.end(`${JSON.stringify(payload)}\n`, () => ctx.shutdown());
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Review recorded: ${verdict} (${issues.length} issue${issues.length === 1 ? "" : "s"})`,
+							text: `Review submitted: ${verdict} (${issues.length} issue${issues.length === 1 ? "" : "s"})`,
 						},
 					],
 				};
 			},
 		});
-
-		pi.registerTool({
-			name: "done",
-			label: "Done",
-			description:
-				"Report completion to the parent session and close this subagent. " +
-				"Call when your task is complete.",
-			parameters: Type.Object({}),
-			async execute(_id, _params, _signal, _onUpdate, ctx) {
-				if (!reviewVerdict) throw new Error("fork: write_review must be called before done");
-				const socket = net.connect(socketPath);
-				socket.on("error", (err) => { throw err; });
-				const payload: ReviewResultPayload = { id, verdict: reviewVerdict };
-				socket.end(`${JSON.stringify(payload)}\n`, () =>
-					ctx.shutdown(),
-				);
-				return { content: [{ type: "text", text: "Done." }] };
-			},
-		});
-
-		pi.setActiveTools([...agent.tools, "write_review", "done"]);
-	} else {
-		pi.registerTool({
-			name: "done",
-			label: "Done",
-			description:
-				"Report completion to the parent session and close this subagent. " +
-				"Call when your task is complete.",
-			parameters: Type.Object({}),
-			async execute(_id, _params, _signal, _onUpdate, ctx) {
-				const socket = net.connect(socketPath);
-				socket.on("error", (err) => { throw err; });
-				socket.end(`${JSON.stringify({ id })}\n`, () =>
-					ctx.shutdown(),
-				);
-				return { content: [{ type: "text", text: "Done." }] };
-			},
-		});
+		pi.setActiveTools([...agent.tools, "review"]);
 	}
 }
 
@@ -628,7 +707,7 @@ export default function (pi: ExtensionAPI) {
 	if (!inTmux()) return;
 
 	pi.registerFlag("agent", {
-		description: "Subagent mode: one of " + agents.map((a) => a.name).join(", "),
+		description: `Subagent mode: one of ${agents.map((a) => a.name).join(", ")}`,
 		type: "string",
 	});
 	pi.registerFlag("subagent-id", {

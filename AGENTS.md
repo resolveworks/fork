@@ -38,7 +38,7 @@ If you're adding error handling: ask yourself whether the error represents a pro
 The extension entry point (`export default function`) checks the environment and branches:
 
 - **Parent role** (`setupParent`): Registers the `plan` tool for the LLM and listens on a per-session Unix domain socket for result messages from children. When a child completes, the parent's `deliverResult` method drives the pipeline mechanically.
-- **Child role** (`setupChild`): Registers agent-specific tools and a `done` tool. When the agent calls `done`, the child sends a JSON result line over the socket and shuts down.
+- **Child role** (`setupChild`): Registers agent-specific tools plus a completion tool (`implement`, `commit`, or `review` depending on the agent). When the agent calls its completion tool, the child sends a JSON result line over the socket and shuts down.
 
 Communication is socket-based: each parent listens on `~/.pi/agent/extensions/fork/sockets/<parentSessionId>.sock` (mode 0o600). Children connect, write one newline-delimited JSON `ResultPayload` (or `ReviewResultPayload` for review agents), and close.
 
@@ -61,10 +61,10 @@ Three agents are hardcoded in the `AGENTS` array in `index.ts`:
 
 1. LLM calls the `plan` tool → parent writes the task file, creates a tmux window, and `send-keys` a `pi --agent plan ...` command into it
 2. Child starts in an isolated pi session, applies the plan system prompt via `before_agent_start`, and reads the task from the task file
-3. Plan agent writes plan.md and step files, then calls `done` → sends `{ id }` over the socket
+3. Plan agent writes plan.md and step files, then calls `implement` → sends `{ id }` over the socket
 4. Parent's `deliverResult` sees a `PlanAgent` completed → calls `startPipeline`, which reads the plan directory to count steps and spawns an `implement` agent for step 1
-5. Implement agent commits the change and calls `done` → parent's `deliverResult` sees an `ImplementAgent` completed → calls `handleImplementComplete`, which spawns a `review` agent for that step
-6. Review agent calls `write_review` (stores verdict in closure) then `done` → sends `ReviewResultPayload { id, verdict }` over the socket
+5. Implement agent makes changes and calls `commit` (stages + commits) → parent's `deliverResult` sees an `ImplementAgent` completed → calls `handleImplementComplete`, which spawns a `review` agent for that step
+6. Review agent calls `review` with its verdict and issues → sends `ReviewResultPayload { id, verdict }` over the socket
 7. Parent's `deliverResult` sees a `ReviewAgent` completed → calls `handleReviewComplete`:
    - If verdict is `"pass"`: advances to next step (spawns implement) or completes the pipeline if all steps done
    - If verdict is `"changes-needed"`: stops the pipeline and notifies the LLM
@@ -100,7 +100,7 @@ The plan directory defaults to `plans/` but can be overridden with the `FORK_PLA
 - To modify an agent: edit its entry in the `AGENTS` array in `index.ts`.
 - To modify tool behavior: edit the `execute` callback in the corresponding `registerTool` call.
 - To change the pipeline: edit `Dispatcher.deliverResult`, `startPipeline`, `spawnImplementStep`, `handleImplementComplete`, or `handleReviewComplete`.
-- To change result delivery: edit `Dispatcher.deliverResult` (parent) or the `done` tool in `setupChild` (child).
+- To change result delivery: edit `Dispatcher.deliverResult` (parent) or the completion tool (`implement`/`commit`/`review`) in `setupChild` (child).
 
 ## Install & Run
 
