@@ -19,7 +19,8 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { type TSchema, Type } from "typebox";
+import type { TSchema } from "typebox";
+import { Type } from "typebox";
 
 // ── tmux ────────────────────────────────────────────────────────────
 
@@ -63,132 +64,92 @@ interface PipelineState {
 	cwd: string;
 }
 
-// ── SubAgent base ───────────────────────────────────────────────────
-
-abstract class SubAgent<P> {
-	abstract readonly name: string;
-	abstract readonly description: string;
-	abstract readonly tools: readonly string[]; // empty = no restriction
-	abstract readonly params: TSchema;
-
-	/** System prompt the child runs under. */
-	abstract systemPrompt(): string;
-
-	/** Build the initial task message the child sees, from typed params. */
-	abstract formatTask(params: P): string;
-
-	/** Parent: register this agent as its own pi tool. */
-	registerTool(pi: ExtensionAPI, dispatcher: Dispatcher): void {
-		pi.registerTool({
-			name: this.name,
-			label: this.name.charAt(0).toUpperCase() + this.name.slice(1),
-			description: this.description,
-			parameters: this.params as TSchema,
-			execute: async (_id, params, _signal, _onUpdate, ctx) =>
-				dispatcher.spawn(this, params as P, ctx.cwd),
-		});
-	}
-
-	/** Child: apply our system prompt and tool restriction. */
-	setupChild(pi: ExtensionAPI): void {
-		pi.on("before_agent_start", () => ({
-			systemPrompt: this.systemPrompt(),
-		}));
-		if (this.tools.length > 0) {
-			pi.setActiveTools([...this.tools]);
-		}
-	}
+interface ReviewIssue {
+	file: string;
+	line: number;
+	issue: string;
 }
 
-// ── concrete agents ─────────────────────────────────────────────────
+// ── agent definitions ───────────────────────────────────────────────
 
 const READ_ONLY = ["read", "grep", "find", "ls"] as const;
 
-class PlanAgent extends SubAgent<{ goal: string; slug: string }> {
-	readonly name = "plan";
-	readonly description =
-		"Create an implementation plan. Reads the codebase and writes plans/<slug>/plan.md + step files.";
-	readonly tools = [...READ_ONLY, "write_plan", "write_step"] as const;
-	readonly params = Type.Object({
+const planAgent = {
+	name: "plan",
+	description:
+		"Create an implementation plan. Reads the codebase and writes plans/<slug>/plan.md + step files.",
+	tools: [...READ_ONLY, "write_plan", "write_step"],
+	params: Type.Object({
 		goal: Type.String({ description: "What the plan should accomplish" }),
 		slug: Type.String({
 			description: "Filename slug; plan is saved to plans/<slug>/",
 		}),
-	});
-
-	systemPrompt(): string {
-		return [
-			"You are a planning specialist. Read the codebase, understand the goal,",
-			"and write a plan as a directory of files under the path given in the task.",
-			"",
-			"Use `write_plan` once to create the overview file (plan.md).",
-			"Use `write_step` to create individual step files — they are auto-numbered.",
-			"You may also use read-only tools. Do not modify any other file.",
-			"",
-			"Before writing, think through:",
-			"- Current state: what exists, key files and their responsibilities.",
-			"- Strategy: how to get from here to the goal, and why this approach.",
-			"- Risks: what could go wrong.",
-			"",
-			"Overview (plan.md) format:",
-			"",
-			"```",
-			"# Plan: <slug>",
-			"",
-			"## Goal",
-			"<what someone can do after this change that they can't do now>",
-			"",
-			"## Context",
-			"<brief orientation: key files, how they fit together, what the implementer needs to know>",
-			"",
-			"## Steps",
-			"1. **<file>** — <what changes>",
-			"   - acceptance: <observable behavior — a command, test, or output>",
-			"2. ...",
-			"",
-			"## Risks",
-			"<things to watch for>",
-			"```",
-			"",
-			"Each step file (step-NNN.md) must be self-contained: include everything",
-			"the implementer needs without reading other steps. Name exact files,",
-			"functions, types, and signatures. Write acceptance as observable behavior",
-			"('test X passes', 'command outputs Y') — not internal state ('added a struct').",
-			"Keep each step to one meaningful commit.",
-			"",
-			"When done, call `implement`.",
-		].join("\n");
-	}
-
-	formatTask({ goal, slug }: { goal: string; slug: string }): string {
+	}),
+	systemPrompt: [
+		"You are a planning specialist. Read the codebase, understand the goal,",
+		"and write a plan as a directory of files under the path given in the task.",
+		"",
+		"Use `write_plan` once to create the overview file (plan.md).",
+		"Use `write_step` to create individual step files — they are auto-numbered.",
+		"You may also use read-only tools. Do not modify any other file.",
+		"",
+		"Before writing, think through:",
+		"- Current state: what exists, key files and their responsibilities.",
+		"- Strategy: how to get from here to the goal, and why this approach.",
+		"- Risks: what could go wrong.",
+		"",
+		"Overview (plan.md) format:",
+		"",
+		"```",
+		"# Plan: <slug>",
+		"",
+		"## Goal",
+		"<what someone can do after this change that they can't do now>",
+		"",
+		"## Context",
+		"<brief orientation: key files, how they fit together, what the implementer needs to know>",
+		"",
+		"## Steps",
+		"1. **<file>** — <what changes>",
+		"   - acceptance: <observable behavior — a command, test, or output>",
+		"2. ...",
+		"",
+		"## Risks",
+		"<things to watch for>",
+		"```",
+		"",
+		"Each step file (step-NNN.md) must be self-contained: include everything",
+		"the implementer needs without reading other steps. Name exact files,",
+		"functions, types, and signatures. Write acceptance as observable behavior",
+		"('test X passes', 'command outputs Y') — not internal state ('added a struct').",
+		"Keep each step to one meaningful commit.",
+		"",
+		"When done, call `implement`.",
+	].join("\n"),
+	formatTask({ goal, slug }) {
 		return `Write a plan for the following goal. Save plan.md and step files under ${planDirFor(slug)}/.\n\nGoal: ${goal}`;
-	}
-}
+	},
+};
 
-class ImplementAgent extends SubAgent<{ plan: string; step: number }> {
-	readonly name = "implement";
-	readonly description =
-		"Implement a single step from a plan. Commits on the current branch.";
-	// `plan` param is a slug (e.g. "dark-mode"); paths are constructed internally.
-	readonly tools: readonly string[] = []; // unrestricted
-	readonly params = Type.Object({
+const implementAgent = {
+	name: "implement",
+	description:
+		"Implement a single step from a plan. Commits on the current branch.",
+	tools: [],
+	params: Type.Object({
 		plan: Type.String({ description: "Plan slug (e.g. dark-mode)" }),
 		step: Type.Number({ description: "Step number to implement" }),
-	});
-
-	systemPrompt(): string {
-		return [
-			"You are an implementation specialist. Implement exactly one step of a",
-			"plan — not more.",
-			"",
-			"- Implement only the step described in the task.",
-			"- Call `commit` when done with a one-line summary of what changed.",
-			"  Pre-commit hooks (type-check, lint, tests) must pass.",
-			"  If a hook fails, fix the underlying issue and re-commit — don't bypass.",
-		].join("\n");
-	}
-
-	formatTask({ plan, step }: { plan: string; step: number }): string {
+	}),
+	systemPrompt: [
+		"You are an implementation specialist. Implement exactly one step of a",
+		"plan — not more.",
+		"",
+		"- Implement only the step described in the task.",
+		"- Call `commit` when done with a one-line summary of what changed.",
+		"  Pre-commit hooks (type-check, lint, tests) must pass.",
+		"  If a hook fails, fix the underlying issue and re-commit — don't bypass.",
+	].join("\n"),
+	formatTask({ plan, step }) {
 		const padded = String(step).padStart(3, "0");
 		const dir = planDirFor(plan);
 		const planPath = path.join(dir, "plan.md");
@@ -210,41 +171,31 @@ class ImplementAgent extends SubAgent<{ plan: string; step: number }> {
 			"",
 			stepContent,
 		].join("\n");
-	}
-}
+	},
+};
 
-interface ReviewIssue {
-	file: string;
-	line: number;
-	issue: string;
-}
-
-class ReviewAgent extends SubAgent<{ plan: string; step: number }> {
-	readonly name = "review";
-	readonly description =
-		"Read-only code review specialist. Reads plan/step files and reviews the latest commit against the step's acceptance criteria.";
-	readonly tools = [...READ_ONLY, "bash"] as const;
-	readonly params = Type.Object({
+const reviewAgent = {
+	name: "review",
+	description:
+		"Read-only code review specialist. Reads plan/step files and reviews the latest commit against the step's acceptance criteria.",
+	tools: [...READ_ONLY, "bash"],
+	params: Type.Object({
 		plan: Type.String({ description: "Plan slug (e.g. dark-mode)" }),
 		step: Type.Number({ description: "Step number to review" }),
-	});
-
-	systemPrompt(): string {
-		return [
-			"You are a code reviewer. You judge whether one step of a plan was",
-			"implemented correctly. Pre-commit hooks already ran — don't re-run",
-			"linters, type-checks, or tests. Focus on judgment:",
-			"",
-			"- Does the diff match the step's acceptance criterion?",
-			"- Design problems, missed edge cases, security issues, inconsistency.",
-			"",
-			"Use `bash` for `git show HEAD` and `git diff` only.",
-			"",
-			"When done, call `review` with your verdict and issues.",
-		].join("\n");
-	}
-
-	formatTask({ plan, step }: { plan: string; step: number }): string {
+	}),
+	systemPrompt: [
+		"You are a code reviewer. You judge whether one step of a plan was",
+		"implemented correctly. Pre-commit hooks already ran — don't re-run",
+		"linters, type-checks, or tests. Focus on judgment:",
+		"",
+		"- Does the diff match the step's acceptance criterion?",
+		"- Design problems, missed edge cases, security issues, inconsistency.",
+		"",
+		"Use `bash` for `git show HEAD` and `git diff` only.",
+		"",
+		"When done, call `review` with your verdict and issues.",
+	].join("\n"),
+	formatTask({ plan, step }) {
 		const padded = String(step).padStart(3, "0");
 		const dir = planDirFor(plan);
 		const planPath = path.join(dir, "plan.md");
@@ -272,224 +223,192 @@ class ReviewAgent extends SubAgent<{ plan: string; step: number }> {
 			"Judge whether the commit meets the step's intent and acceptance.",
 			"Call `review` with your verdict and any issues.",
 		].join("\n");
-	}
+	},
+};
+
+// ── spawn / pipeline ────────────────────────────────────────────────
+
+function tmuxSession(): string {
+	return execSync("tmux display-message -p '#S'", {
+		encoding: "utf-8",
+		timeout: 3000,
+	}).trim();
 }
 
-// ── registry ────────────────────────────────────────────────────────
+function spawn(
+	pi: ExtensionAPI,
+	agent: typeof planAgent | typeof implementAgent | typeof reviewAgent,
+	params: any,
+	{ session, sessionId, active }: State,
+	cwd: string,
+): { content: Array<{ type: "text"; text: string }> } {
+	const id = `pi-${agent.name}-${Date.now().toString(36)}`;
+	const taskPath = path.join(TASKS_DIR, `${id}.md`);
+	fs.writeFileSync(taskPath, agent.formatTask(params), { mode: 0o600 });
 
-const agents: SubAgent<Record<string, unknown>>[] = [
-	new PlanAgent(),
-	new ImplementAgent(),
-	new ReviewAgent(),
-];
-const agentByName = new Map(agents.map((a) => [a.name, a]));
+	const win = execSync(
+		`tmux new-window -t ${session} -n ${id} -c ${cwd} -P -F '#I'`,
+		{ encoding: "utf-8", timeout: 3000 },
+	).trim();
+	execSync(`tmux set-option -t ${session}:${win} -w remain-on-exit off`, {
+		encoding: "utf-8",
+		timeout: 3000,
+	});
 
-// ── parent: dispatcher ──────────────────────────────────────────────
+	const cmdParts = [
+		"pi",
+		"--agent",
+		agent.name,
+		"--subagent-id",
+		id,
+		"--subagent-socket",
+		socketPathFor(sessionId),
+	];
+	if (agent === planAgent) {
+		cmdParts.push("--subagent-plan-slug", (params as { slug: string }).slug);
+	}
+	cmdParts.push(`@${taskPath}`);
+	execSync(
+		`tmux send-keys -t ${session}:${win} ${JSON.stringify(cmdParts.join(" "))} Enter`,
+		{ encoding: "utf-8", timeout: 3000 },
+	);
 
-class Dispatcher {
-	private active = new Map<
-		string,
-		{
-			agent: SubAgent<Record<string, unknown>>;
-			params: Record<string, unknown>;
-			tmuxWindow: string;
-			cwd: string;
-		}
-	>();
-	private pipeline: PipelineState | null = null;
-	private session: string;
-	private currentSessionId: string | null = null;
+	active.set(id, { agent, params, tmuxWindow: win, cwd });
 
-	constructor(private pi: ExtensionAPI) {
-		this.session = execSync("tmux display-message -p '#S'", {
-			encoding: "utf-8",
-			timeout: 3000,
-		}).trim();
+	return {
+		content: [
+			{
+				type: "text",
+				text: `Spawned ${agent.name} in tmux window ${win}. Result will be delivered when done.`,
+			},
+		],
+	};
+}
+
+function notify(pi: ExtensionAPI, message: string): void {
+	pi.sendMessage(
+		{ customType: RESULT_TYPE, content: message, display: true },
+		{ triggerTurn: true },
+	);
+}
+
+function spawnImplementStep(pi: ExtensionAPI, state: State): void {
+	if (!state.pipeline) throw new Error("fork: no active pipeline");
+	const { slug, currentStep, totalSteps } = state.pipeline;
+
+	notify(pi, `Implementing step ${currentStep}/${totalSteps}...`);
+	spawn(
+		pi,
+		implementAgent,
+		{ plan: slug, step: currentStep },
+		state,
+		state.pipeline.cwd,
+	);
+}
+
+function startPipeline(
+	pi: ExtensionAPI,
+	state: State,
+	slug: string,
+	cwd: string,
+): void {
+	const planDir = planDirFor(slug);
+	const stepFiles = fs
+		.readdirSync(planDir)
+		.filter((f) => f.match(/^step-\d{3}\.md$/))
+		.sort();
+
+	if (stepFiles.length === 0) {
+		notify(pi, "Plan completed with no steps. Nothing to implement.");
+		return;
 	}
 
-	setSessionId(id: string): void {
-		this.currentSessionId = id;
-	}
+	state.pipeline = { slug, totalSteps: stepFiles.length, currentStep: 1, cwd };
+	spawnImplementStep(pi, state);
+}
 
-	spawn<P>(
-		agent: SubAgent<P>,
-		params: P,
-		cwd: string,
-	): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
-		if (!this.currentSessionId) {
-			throw new Error(
-				"fork: spawn called before session_start; no session id available",
-			);
-		}
-		const id = `pi-${agent.name}-${Date.now().toString(36)}`;
-		const taskPath = path.join(TASKS_DIR, `${id}.md`);
-		fs.writeFileSync(taskPath, agent.formatTask(params), { mode: 0o600 });
-
-		const win = execSync(
-			`tmux new-window -t ${this.session} -n ${id} -c ${cwd} -P -F '#I'`,
-			{ encoding: "utf-8", timeout: 3000 },
-		).trim();
-		execSync(
-			`tmux set-option -t ${this.session}:${win} -w remain-on-exit off`,
-			{ encoding: "utf-8", timeout: 3000 },
+function deliverResult(
+	pi: ExtensionAPI,
+	state: State,
+	payload: ResultPayload,
+): void {
+	const slot = state.active.get(payload.id);
+	if (!slot)
+		throw new Error(
+			`fork: deliverResult called for unknown agent ${payload.id}`,
 		);
 
-		const cmdParts = [
-			"pi",
-			"--agent",
-			agent.name,
-			"--subagent-id",
-			id,
-			"--subagent-socket",
-			socketPathFor(this.currentSessionId),
-		];
-		if (agent instanceof PlanAgent) {
-			cmdParts.push("--subagent-plan-slug", (params as { slug: string }).slug);
-		}
-		cmdParts.push(`@${taskPath}`);
-		const cmd = cmdParts.join(" ");
-		execSync(
-			`tmux send-keys -t ${this.session}:${win} ${JSON.stringify(cmd)} Enter`,
-			{ encoding: "utf-8", timeout: 3000 },
-		);
+	state.active.delete(payload.id);
+	execSync(`tmux kill-window -t ${state.session}:${slot.tmuxWindow}`, {
+		encoding: "utf-8",
+		timeout: 3000,
+	});
+	fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
 
-		this.active.set(id, { agent, params, tmuxWindow: win, cwd });
-
-		return {
-			content: [
-				{
-					type: "text",
-					text: `Spawned ${agent.name} in tmux window ${win}. Result will be delivered when done.`,
-				},
-			],
-		};
-	}
-
-	deliverResult(payload: ResultPayload): void {
-		const slot = this.active.get(payload.id);
-		if (!slot)
-			throw new Error(
-				`fork: deliverResult called for unknown agent ${payload.id}`,
-			);
-
-		this.active.delete(payload.id);
-		execSync(`tmux kill-window -t ${this.session}:${slot.tmuxWindow}`, {
-			encoding: "utf-8",
-			timeout: 3000,
-		});
-		fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
-
-		if (slot.agent instanceof PlanAgent) {
-			this.startPipeline(slot.params as { slug: string }, slot.cwd);
-		} else if (slot.agent instanceof ImplementAgent) {
-			this.handleImplementComplete(
-				slot.params as { plan: string; step: number },
-			);
-		} else if (slot.agent instanceof ReviewAgent) {
-			const { verdict } = payload as ReviewResultPayload;
-			this.handleReviewComplete(
-				slot.params as { plan: string; step: number },
-				verdict,
-			);
-		}
-	}
-
-	private startPipeline(params: { slug: string }, cwd: string): void {
-		const { slug } = params;
-		const planDir = planDirFor(slug);
-		const stepFiles = fs
-			.readdirSync(planDir)
-			.filter((f) => f.match(/^step-\d{3}\.md$/))
-			.sort();
-
-		if (stepFiles.length === 0) {
-			this.notify("Plan completed with no steps. Nothing to implement.");
-			return;
-		}
-
-		this.pipeline = { slug, totalSteps: stepFiles.length, currentStep: 1, cwd };
-		this.spawnImplementStep();
-	}
-
-	private spawnImplementStep(): void {
-		if (!this.pipeline) throw new Error("fork: no active pipeline");
-		const { slug, currentStep, totalSteps } = this.pipeline;
-
-		this.notify(`Implementing step ${currentStep}/${totalSteps}...`);
-
-		const implementAgent = agentByName.get("implement");
-		if (!implementAgent)
-			throw new Error("fork: implement agent not found in registry");
-		this.spawn(
-			implementAgent,
-			{ plan: slug, step: currentStep },
-			this.pipeline.cwd,
-		);
-	}
-
-	private handleImplementComplete(params: {
-		plan: string;
-		step: number;
-	}): void {
-		if (!this.pipeline) throw new Error("fork: no active pipeline");
-
-		this.notify(`Step ${params.step} implemented. Reviewing...`);
-
-		const reviewAgent = agentByName.get("review");
-		if (!reviewAgent)
-			throw new Error("fork: review agent not found in registry");
-		this.spawn(
-			reviewAgent,
-			{ plan: params.plan, step: params.step },
-			this.pipeline.cwd,
-		);
-	}
-
-	private handleReviewComplete(
-		params: { plan: string; step: number },
-		verdict: "pass" | "changes-needed",
-	): void {
-		if (!this.pipeline) throw new Error("fork: no active pipeline");
-
+	const name = slot.agent.name;
+	if (name === "plan") {
+		startPipeline(pi, state, (slot.params as { slug: string }).slug, slot.cwd);
+	} else if (name === "implement") {
+		if (!state.pipeline) throw new Error("fork: no active pipeline");
+		const { plan, step } = slot.params as { plan: string; step: number };
+		notify(pi, `Step ${step} implemented. Reviewing...`);
+		spawn(pi, reviewAgent, { plan, step }, state, state.pipeline.cwd);
+	} else if (name === "review") {
+		if (!state.pipeline) throw new Error("fork: no active pipeline");
+		const { plan, step } = slot.params as { plan: string; step: number };
+		const { verdict } = payload as ReviewResultPayload;
 		if (verdict === "pass") {
-			this.pipeline.currentStep++;
-			if (this.pipeline.currentStep > this.pipeline.totalSteps) {
-				this.notify(
-					`All ${this.pipeline.totalSteps} steps implemented and reviewed.`,
+			state.pipeline.currentStep++;
+			if (state.pipeline.currentStep > state.pipeline.totalSteps) {
+				notify(
+					pi,
+					`All ${state.pipeline.totalSteps} steps implemented and reviewed.`,
 				);
-				this.pipeline = null;
+				state.pipeline = null;
 			} else {
-				this.spawnImplementStep();
+				spawnImplementStep(pi, state);
 			}
 		} else {
-			this.notify(`Review failed for step ${params.step}. Pipeline stopped.`);
-			this.pipeline = null;
+			notify(pi, `Review failed for step ${step}. Pipeline stopped.`);
+			state.pipeline = null;
 		}
-	}
-
-	private notify(message: string): void {
-		this.pi.sendMessage(
-			{ customType: RESULT_TYPE, content: message, display: true },
-			{ triggerTurn: true },
-		);
 	}
 }
 
 // ── parent role ─────────────────────────────────────────────────────
 
+interface ActiveSlot {
+	agent: typeof planAgent | typeof implementAgent | typeof reviewAgent;
+	params: any;
+	tmuxWindow: string;
+	cwd: string;
+}
+
+interface State {
+	session: string;
+	sessionId: string;
+	active: Map<string, ActiveSlot>;
+	pipeline: PipelineState | null;
+}
+
 function setupParent(pi: ExtensionAPI): void {
 	fs.mkdirSync(SOCKETS_DIR, { recursive: true });
 	fs.mkdirSync(TASKS_DIR, { recursive: true });
 
-	const dispatcher = new Dispatcher(pi);
+	const state: State = {
+		session: tmuxSession(),
+		sessionId: "",
+		active: new Map(),
+		pipeline: null,
+	};
+
 	let server: net.Server | null = null;
 	let sockPath: string | null = null;
 
 	pi.on("session_start", (_event, ctx) => {
-		const sessionId = ctx.sessionManager.getSessionId();
-		dispatcher.setSessionId(sessionId);
+		state.sessionId = ctx.sessionManager.getSessionId();
 
-		sockPath = socketPathFor(sessionId);
+		sockPath = socketPathFor(state.sessionId);
 		server = net.createServer((socket) => {
 			let buf = "";
 			socket.setEncoding("utf-8");
@@ -499,8 +418,7 @@ function setupParent(pi: ExtensionAPI): void {
 					const line = buf.slice(0, nl);
 					buf = buf.slice(nl + 1);
 					if (line.length === 0) continue;
-					const payload = JSON.parse(line) as ResultPayload;
-					dispatcher.deliverResult(payload);
+					deliverResult(pi, state, JSON.parse(line) as ResultPayload);
 				}
 			});
 		});
@@ -518,16 +436,27 @@ function setupParent(pi: ExtensionAPI): void {
 	});
 
 	// Only expose plan to the LLM; implement and review run mechanically
-	const planAgent = agentByName.get("plan");
-	if (!planAgent) throw new Error("fork: plan agent not found in registry");
-	planAgent.registerTool(pi, dispatcher);
+	pi.registerTool({
+		name: planAgent.name,
+		label: "Plan",
+		description: planAgent.description,
+		parameters: planAgent.params as TSchema,
+		execute: async (_id, params, _signal, _onUpdate, ctx) =>
+			spawn(
+				pi,
+				planAgent,
+				params as { goal: string; slug: string },
+				state,
+				ctx.cwd,
+			),
+	});
 }
 
 // ── child role ──────────────────────────────────────────────────────
 
 function setupChild(
 	pi: ExtensionAPI,
-	agent: SubAgent<Record<string, unknown>>,
+	agent: typeof planAgent | typeof implementAgent | typeof reviewAgent,
 ): void {
 	const id = pi.getFlag("subagent-id") as string | undefined;
 	const socketPath = pi.getFlag("subagent-socket") as string | undefined;
@@ -536,10 +465,13 @@ function setupChild(
 	if (!socketPath)
 		throw new Error("fork: subagent missing required --subagent-socket flag");
 
-	agent.setupChild(pi);
+	pi.on("before_agent_start", () => ({ systemPrompt: agent.systemPrompt }));
+	if (agent.tools.length > 0) {
+		pi.setActiveTools([...agent.tools]);
+	}
 
 	// Register plan-specific tools for PlanAgent
-	if (agent instanceof PlanAgent) {
+	if (agent === planAgent) {
 		const slug = pi.getFlag("subagent-plan-slug") as string | undefined;
 		if (!slug)
 			throw new Error(
@@ -629,7 +561,7 @@ function setupChild(
 		]);
 	}
 
-	if (agent instanceof ImplementAgent) {
+	if (agent === implementAgent) {
 		pi.registerTool({
 			name: "commit",
 			label: "Commit",
@@ -655,7 +587,7 @@ function setupChild(
 			},
 		});
 		pi.setActiveTools([...agent.tools, "commit"]);
-	} else if (agent instanceof ReviewAgent) {
+	} else if (agent === reviewAgent) {
 		pi.registerTool({
 			name: "review",
 			label: "Review",
@@ -707,7 +639,7 @@ export default function (pi: ExtensionAPI) {
 	if (!inTmux()) return;
 
 	pi.registerFlag("agent", {
-		description: `Subagent mode: one of ${agents.map((a) => a.name).join(", ")}`,
+		description: `Subagent mode: one of plan, implement, review`,
 		type: "string",
 	});
 	pi.registerFlag("subagent-id", {
@@ -725,7 +657,14 @@ export default function (pi: ExtensionAPI) {
 
 	const agentName = pi.getFlag("agent") as string | undefined;
 	if (agentName) {
-		const agent = agentByName.get(agentName);
+		const agent =
+			agentName === "plan"
+				? planAgent
+				: agentName === "implement"
+					? implementAgent
+					: agentName === "review"
+						? reviewAgent
+						: undefined;
 		if (!agent) throw new Error(`fork: unknown agent "${agentName}"`);
 		setupChild(pi, agent);
 		return;

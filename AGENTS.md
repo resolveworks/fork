@@ -19,7 +19,7 @@ If you're adding error handling: ask yourself whether the error represents a pro
 
 ```
 .
-├── index.ts          # The entire extension (single file, ~650 lines)
+├── index.ts          # The entire extension (single file)
 ├── package.json      # Declares the extension via pi.extensions field
 └── README.md
 ```
@@ -37,14 +37,14 @@ If you're adding error handling: ask yourself whether the error represents a pro
 
 The extension entry point (`export default function`) checks the environment and branches:
 
-- **Parent role** (`setupParent`): Registers the `plan` tool for the LLM and listens on a per-session Unix domain socket for result messages from children. When a child completes, the parent's `deliverResult` method drives the pipeline mechanically.
+- **Parent role** (`setupParent`): Registers the `plan` tool for the LLM and listens on a per-session Unix domain socket for result messages from children. When a child completes, `deliverResult` drives the pipeline mechanically.
 - **Child role** (`setupChild`): Registers agent-specific tools plus a completion tool (`implement`, `commit`, or `review` depending on the agent). When the agent calls its completion tool, the child sends a JSON result line over the socket and shuts down.
 
 Communication is socket-based: each parent listens on `~/.pi/agent/extensions/fork/sockets/<parentSessionId>.sock` (mode 0o600). Children connect, write one newline-delimited JSON `ResultPayload` (or `ReviewResultPayload` for review agents), and close.
 
 ### Agents
 
-Three agents are hardcoded in the `AGENTS` array in `index.ts`:
+Three agents are defined as plain objects conforming to the `Agent<P>` interface near the top of `index.ts`:
 
 - **plan** — The only agent accessible to the LLM. Read-only planning specialist. Uses dedicated `write_plan` and `write_step` tools to write `plans/<slug>/plan.md` (overview) and `plans/<slug>/step-NNN.md` (one per step).
 - **implement** — Spawns mechanically after planning. Executes a single step. Reads `plans/<slug>/plan.md` for overview context and `plans/<slug>/step-NNN.md` for the specific step. The `plan` param is a slug (e.g. `dark-mode`); paths are constructed internally.
@@ -52,7 +52,8 @@ Three agents are hardcoded in the `AGENTS` array in `index.ts`:
 
 ### Key Types
 
-- `SubAgent<P>` — base class for an agent definition (name, description, tools, system prompt, task formatter)
+- `Agent<P>` — plain object interface for an agent definition (name, description, tools, params, systemPrompt, formatTask)
+- `State` — mutable bag closed over by parent functions: `{ session, sessionId, active, pipeline }`
 - `ResultPayload` — JSON sent by plan and implement children: `{ id }`
 - `ReviewResultPayload` — extends `ResultPayload` with `verdict: "pass" | "changes-needed"`, sent by review children
 - `PipelineState` — tracks the mechanical pipeline: `{ slug, totalSteps, currentStep, cwd }`
@@ -62,10 +63,10 @@ Three agents are hardcoded in the `AGENTS` array in `index.ts`:
 1. LLM calls the `plan` tool → parent writes the task file, creates a tmux window, and `send-keys` a `pi --agent plan ...` command into it
 2. Child starts in an isolated pi session, applies the plan system prompt via `before_agent_start`, and reads the task from the task file
 3. Plan agent writes plan.md and step files, then calls `implement` → sends `{ id }` over the socket
-4. Parent's `deliverResult` sees a `PlanAgent` completed → calls `startPipeline`, which reads the plan directory to count steps and spawns an `implement` agent for step 1
-5. Implement agent makes changes and calls `commit` (stages + commits) → parent's `deliverResult` sees an `ImplementAgent` completed → calls `handleImplementComplete`, which spawns a `review` agent for that step
+4. `deliverResult` sees a plan agent completed → calls `startPipeline`, which reads the plan directory to count steps and spawns an implement agent for step 1
+5. Implement agent makes changes and calls `commit` (stages + commits) → `deliverResult` sees an implement agent completed → spawns a review agent for that step
 6. Review agent calls `review` with its verdict and issues → sends `ReviewResultPayload { id, verdict }` over the socket
-7. Parent's `deliverResult` sees a `ReviewAgent` completed → calls `handleReviewComplete`:
+7. `deliverResult` sees a review agent completed:
    - If verdict is `"pass"`: advances to next step (spawns implement) or completes the pipeline if all steps done
    - If verdict is `"changes-needed"`: stops the pipeline and notifies the LLM
 8. Clean completions automatically close the subagent's tmux window and remove its task file
@@ -89,7 +90,7 @@ The plan directory defaults to `plans/` but can be overridden with the `FORK_PLA
 ## Conventions
 
 - **Single-file extension.** Everything lives in `index.ts`. If the file grows, consider splitting but keep the pi extension entry as the default export.
-- **Agent definitions** are hardcoded in the `AGENTS` array near the top of `index.ts`.
+- **Agent definitions** are plain objects near the top of `index.ts`. No classes, no registry.
 - **No build step.** pi loads `.ts` files directly via its runtime.
 - **No tests currently.** If adding tests, note the heavy tmux dependency would need mocking.
 - **Error handling** follows fail-fast: if something is wrong, throw or crash with a clear message. No silent catches, no empty-string fallbacks. If tmux isn't available, say so and fail.
@@ -97,10 +98,10 @@ The plan directory defaults to `plans/` but can be overridden with the `FORK_PLA
 
 ## Making Changes
 
-- To modify an agent: edit its entry in the `AGENTS` array in `index.ts`.
+- To modify an agent: edit its object literal in `index.ts`.
 - To modify tool behavior: edit the `execute` callback in the corresponding `registerTool` call.
-- To change the pipeline: edit `Dispatcher.deliverResult`, `startPipeline`, `spawnImplementStep`, `handleImplementComplete`, or `handleReviewComplete`.
-- To change result delivery: edit `Dispatcher.deliverResult` (parent) or the completion tool (`implement`/`commit`/`review`) in `setupChild` (child).
+- To change the pipeline: edit `deliverResult`, `startPipeline`, or `spawnImplementStep`.
+- To change result delivery: edit `deliverResult` (parent) or the completion tool (`implement`/`commit`/`review`) in `setupChild` (child).
 
 ## Install & Run
 
