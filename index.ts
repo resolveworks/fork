@@ -54,7 +54,16 @@ interface ResultPayload {
 	id: string;
 }
 
+interface ReviewResultPayload extends ResultPayload {
+	verdict: "pass" | "changes-needed";
+}
 
+interface PipelineState {
+	slug: string;
+	totalSteps: number;
+	currentStep: number;
+	cwd: string;
+}
 
 // ── SubAgent base ───────────────────────────────────────────────────
 
@@ -78,7 +87,7 @@ abstract class SubAgent<P> {
 			description: this.description,
 			parameters: this.params as any,
 			execute: async (_id, params, _signal, _onUpdate, ctx) =>
-				dispatcher.spawn(this, params as P, ctx),
+				dispatcher.spawn(this, params as P, ctx.cwd),
 		});
 	}
 
@@ -218,16 +227,15 @@ interface ReviewIssue {
 }
 
 class ReviewAgent extends SubAgent<
-	{ plan: string; step: number; commit: string }
+	{ plan: string; step: number }
 > {
 	readonly name = "review";
 	readonly description =
-		"Read-only code review specialist. Reads plan/step files and reviews the commit against the step's acceptance criteria.";
+		"Read-only code review specialist. Reads plan/step files and reviews the latest commit against the step's acceptance criteria.";
 	readonly tools = [...READ_ONLY, "bash", "write_review"] as const;
 	readonly params = Type.Object({
 		plan: Type.String({ description: "Plan slug (e.g. dark-mode)" }),
 		step: Type.Number({ description: "Step number to review" }),
-		commit: Type.String({ description: "Commit SHA implementing the step" }),
 	});
 
 	systemPrompt(): string {
@@ -239,7 +247,7 @@ class ReviewAgent extends SubAgent<
 			"- Does the diff match the step's acceptance criterion?",
 			"- Design problems, missed edge cases, security issues, inconsistency.",
 			"",
-			"Use `bash` for `git show <commit>` and `git diff` only.",
+			"Use `bash` for `git show HEAD` and `git diff` only.",
 			"",
 			"When done, call `write_review` with your verdict and issues, then call `done`.",
 		].join("\n");
@@ -248,8 +256,7 @@ class ReviewAgent extends SubAgent<
 	formatTask({
 		plan,
 		step,
-		commit,
-	}: { plan: string; step: number; commit: string }): string {
+	}: { plan: string; step: number }): string {
 		const padded = String(step).padStart(3, "0");
 		const dir = planDirFor(plan);
 		const planPath = path.join(dir, "plan.md");
@@ -263,7 +270,7 @@ class ReviewAgent extends SubAgent<
 		const planContent = fs.readFileSync(planPath, "utf-8");
 		const stepContent = fs.readFileSync(stepPath, "utf-8");
 		return [
-			`Review commit ${commit}, which implements step ${padded} of plan "${plan}".`,
+			`Review the latest commit, which implements step ${padded} of plan "${plan}".`,
 			"",
 			"# Plan Overview",
 			"",
@@ -273,7 +280,7 @@ class ReviewAgent extends SubAgent<
 			"",
 			stepContent,
 			"",
-			`Inspect the diff with \`git show ${commit}\`.`,
+			"Inspect the diff with `git show HEAD`.",
 			"Judge whether the commit meets the step's intent and acceptance.",
 			"Call `write_review` with your verdict and any issues.",
 			"Then call `done`.",
@@ -293,7 +300,8 @@ const agentByName = new Map(agents.map((a) => [a.name, a]));
 // ── parent: dispatcher ──────────────────────────────────────────────
 
 class Dispatcher {
-	private active = new Map<string, { agent: SubAgent<any>; params: any; tmuxWindow: string }>();
+	private active = new Map<string, { agent: SubAgent<any>; params: any; tmuxWindow: string; cwd: string }>();
+	private pipeline: PipelineState | null = null;
 	private session: string;
 	private currentSessionId: string | null = null;
 
@@ -308,7 +316,7 @@ class Dispatcher {
 	spawn<P>(
 		agent: SubAgent<P>,
 		params: P,
-		ctx: { cwd: string },
+		cwd: string,
 	): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
 		if (!this.currentSessionId) {
 			throw new Error(
@@ -320,7 +328,7 @@ class Dispatcher {
 		fs.writeFileSync(taskPath, agent.formatTask(params), { mode: 0o600 });
 
 		const win = execSync(
-			`tmux new-window -t ${this.session} -n ${id} -c ${ctx.cwd} -P -F '#I'`,
+			`tmux new-window -t ${this.session} -n ${id} -c ${cwd} -P -F '#I'`,
 			{ encoding: "utf-8", timeout: 3000 },
 		).trim();
 		execSync(`tmux set-option -t ${this.session}:${win} -w remain-on-exit off`, { encoding: "utf-8", timeout: 3000 });
@@ -341,7 +349,7 @@ class Dispatcher {
 		const cmd = cmdParts.join(" ");
 		execSync(`tmux send-keys -t ${this.session}:${win} ${JSON.stringify(cmd)} Enter`, { encoding: "utf-8", timeout: 3000 });
 
-		this.active.set(id, { agent, params, tmuxWindow: win });
+		this.active.set(id, { agent, params, tmuxWindow: win, cwd });
 
 		return {
 			content: [
@@ -357,18 +365,77 @@ class Dispatcher {
 		const slot = this.active.get(payload.id);
 		if (!slot) throw new Error(`fork: deliverResult called for unknown agent ${payload.id}`);
 
-		this.pi.sendMessage(
-			{
-				customType: RESULT_TYPE,
-				content: `Subagent **${slot.agent.name}** completed.`,
-				display: true,
-			},
-			{ triggerTurn: true },
-		);
-
 		this.active.delete(payload.id);
 		execSync(`tmux kill-window -t ${this.session}:${slot.tmuxWindow}`, { encoding: "utf-8", timeout: 3000 });
 		fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
+
+		if (slot.agent instanceof PlanAgent) {
+			this.startPipeline(slot.params as { slug: string }, slot.cwd);
+		} else if (slot.agent instanceof ImplementAgent) {
+			this.handleImplementComplete(slot.params as { plan: string; step: number });
+		} else if (slot.agent instanceof ReviewAgent) {
+			const { verdict } = payload as ReviewResultPayload;
+			this.handleReviewComplete(slot.params as { plan: string; step: number }, verdict);
+		}
+	}
+
+	private startPipeline(params: { slug: string }, cwd: string): void {
+		const { slug } = params;
+		const planDir = planDirFor(slug);
+		const stepFiles = fs.readdirSync(planDir)
+			.filter((f) => f.match(/^step-\d{3}\.md$/))
+			.sort();
+
+		if (stepFiles.length === 0) {
+			this.notify("Plan completed with no steps. Nothing to implement.");
+			return;
+		}
+
+		this.pipeline = { slug, totalSteps: stepFiles.length, currentStep: 1, cwd };
+		this.spawnImplementStep();
+	}
+
+	private spawnImplementStep(): void {
+		if (!this.pipeline) throw new Error("fork: no active pipeline");
+		const { slug, currentStep, totalSteps } = this.pipeline;
+
+		this.notify(`Implementing step ${currentStep}/${totalSteps}...`);
+
+		const implementAgent = agentByName.get("implement")!;
+		this.spawn(implementAgent, { plan: slug, step: currentStep }, this.pipeline.cwd);
+	}
+
+	private handleImplementComplete(params: { plan: string; step: number }): void {
+		if (!this.pipeline) throw new Error("fork: no active pipeline");
+
+		this.notify(`Step ${params.step} implemented. Reviewing...`);
+
+		const reviewAgent = agentByName.get("review")!;
+		this.spawn(reviewAgent, { plan: params.plan, step: params.step }, this.pipeline.cwd);
+	}
+
+	private handleReviewComplete(params: { plan: string; step: number }, verdict: "pass" | "changes-needed"): void {
+		if (!this.pipeline) throw new Error("fork: no active pipeline");
+
+		if (verdict === "pass") {
+			this.pipeline.currentStep++;
+			if (this.pipeline.currentStep > this.pipeline.totalSteps) {
+				this.notify(`All ${this.pipeline.totalSteps} steps implemented and reviewed.`);
+				this.pipeline = null;
+			} else {
+				this.spawnImplementStep();
+			}
+		} else {
+			this.notify(`Review failed for step ${params.step}. Pipeline stopped.`);
+			this.pipeline = null;
+		}
+	}
+
+	private notify(message: string): void {
+		this.pi.sendMessage(
+			{ customType: RESULT_TYPE, content: message, display: true },
+			{ triggerTurn: true },
+		);
 	}
 }
 
@@ -414,7 +481,8 @@ function setupParent(pi: ExtensionAPI): void {
 		sockPath = null;
 	});
 
-	for (const a of agents) a.registerTool(pi, dispatcher);
+	// Only expose plan to the LLM; implement and review run mechanically
+	agentByName.get("plan")!.registerTool(pi, dispatcher);
 }
 
 // ── child role ──────────────────────────────────────────────────────
@@ -476,6 +544,8 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any>): void {
 	}
 
 	if (agent instanceof ReviewAgent) {
+		let reviewVerdict: "pass" | "changes-needed" | undefined;
+
 		pi.registerTool({
 			name: "write_review",
 			label: "Write Review",
@@ -500,6 +570,7 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any>): void {
 					verdict: "pass" | "changes-needed";
 					issues: ReviewIssue[];
 				};
+				reviewVerdict = verdict;
 				return {
 					content: [
 						{
@@ -511,25 +582,44 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any>): void {
 			},
 		});
 
-		pi.setActiveTools([...agent.tools, "write_review", "done"]);
-	}
+		pi.registerTool({
+			name: "done",
+			label: "Done",
+			description:
+				"Report completion to the parent session and close this subagent. " +
+				"Call when your task is complete.",
+			parameters: Type.Object({}),
+			async execute(_id, _params, _signal, _onUpdate, ctx) {
+				if (!reviewVerdict) throw new Error("fork: write_review must be called before done");
+				const socket = net.connect(socketPath);
+				socket.on("error", (err) => { throw err; });
+				const payload: ReviewResultPayload = { id, verdict: reviewVerdict };
+				socket.end(`${JSON.stringify(payload)}\n`, () =>
+					ctx.shutdown(),
+				);
+				return { content: [{ type: "text", text: "Done." }] };
+			},
+		});
 
-	pi.registerTool({
-		name: "done",
-		label: "Done",
-		description:
-			"Report completion to the parent session and close this subagent. " +
-			"Call when your task is complete.",
-		parameters: Type.Object({}),
-		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			const socket = net.connect(socketPath);
-			socket.on("error", (err) => { throw err; });
-			socket.end(`${JSON.stringify({ id })}\n`, () =>
-				ctx.shutdown(),
-			);
-			return { content: [{ type: "text", text: "Done." }] };
-		},
-	});
+		pi.setActiveTools([...agent.tools, "write_review", "done"]);
+	} else {
+		pi.registerTool({
+			name: "done",
+			label: "Done",
+			description:
+				"Report completion to the parent session and close this subagent. " +
+				"Call when your task is complete.",
+			parameters: Type.Object({}),
+			async execute(_id, _params, _signal, _onUpdate, ctx) {
+				const socket = net.connect(socketPath);
+				socket.on("error", (err) => { throw err; });
+				socket.end(`${JSON.stringify({ id })}\n`, () =>
+					ctx.shutdown(),
+				);
+				return { content: [{ type: "text", text: "Done." }] };
+			},
+		});
+	}
 }
 
 // ── extension entry ─────────────────────────────────────────────────

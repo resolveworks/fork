@@ -2,7 +2,7 @@
 
 ## Overview
 
-**fork** is a [pi](https://github.com/earendil-works/pi) extension that manages subagents as separate interactive pi sessions in tmux windows. When the LLM calls the `subagent` tool, fork spawns a new tmux window running a full pi session with an isolated context window. Results flow back to the parent as notification messages when a subagent completes.
+**fork** is a [pi](https://github.com/earendil-works/pi) extension that manages subagents as separate interactive pi sessions in tmux windows. The LLM calls a single `plan` tool; when the plan completes, fork mechanically spawns implement and review agents for each step in sequence. Results flow back to the parent as notification messages.
 
 ## Philosophy
 
@@ -19,7 +19,7 @@ If you're adding error handling: ask yourself whether the error represents a pro
 
 ```
 .
-├── index.ts          # The entire extension (single file, ~400 lines)
+├── index.ts          # The entire extension (single file, ~650 lines)
 ├── package.json      # Declares the extension via pi.extensions field
 └── README.md
 ```
@@ -37,33 +37,38 @@ If you're adding error handling: ask yourself whether the error represents a pro
 
 The extension entry point (`export default function`) checks the environment and branches:
 
-- **Parent role** (`setupParent`): Registers one tool per agent and listens on a per-session Unix domain socket for result messages from children.
-- **Child role** (`setupChild`): Listens for `agent_end` events and sends a JSON result line over the socket address it was given at spawn.
+- **Parent role** (`setupParent`): Registers the `plan` tool for the LLM and listens on a per-session Unix domain socket for result messages from children. When a child completes, the parent's `deliverResult` method drives the pipeline mechanically.
+- **Child role** (`setupChild`): Registers agent-specific tools and a `done` tool. When the agent calls `done`, the child sends a JSON result line over the socket and shuts down.
 
-Communication is socket-based: each parent listens on `~/.pi/agent/extensions/fork/sockets/<parentSessionId>.sock` (mode 0o600). Children connect, write one newline-delimited JSON `ResultPayload`, and close. Per-parent socket scoping replaces the previous shared results directory.
+Communication is socket-based: each parent listens on `~/.pi/agent/extensions/fork/sockets/<parentSessionId>.sock` (mode 0o600). Children connect, write one newline-delimited JSON `ResultPayload` (or `ReviewResultPayload` for review agents), and close.
 
 ### Agents
 
 Three agents are hardcoded in the `AGENTS` array in `index.ts`:
 
-- **plan** — Read-only planning specialist. Uses dedicated `write_plan` and `write_step` tools to write `plans/<slug>/plan.md` (overview) and `plans/<slug>/step-NNN.md` (one per step).
-- **implement** — Executes a single step. Reads `plans/<slug>/plan.md` for overview context and `plans/<slug>/step-NNN.md` for the specific step. The `plan` param is a slug (e.g. `dark-mode`); paths are constructed internally.
-- **review** — Read-only code review specialist. Reads the same plan/step files and reviews the commit against the step's acceptance criteria.
-
-This keeps the interplay between them tightly controlled and easy to iterate on.
+- **plan** — The only agent accessible to the LLM. Read-only planning specialist. Uses dedicated `write_plan` and `write_step` tools to write `plans/<slug>/plan.md` (overview) and `plans/<slug>/step-NNN.md` (one per step).
+- **implement** — Spawns mechanically after planning. Executes a single step. Reads `plans/<slug>/plan.md` for overview context and `plans/<slug>/step-NNN.md` for the specific step. The `plan` param is a slug (e.g. `dark-mode`); paths are constructed internally.
+- **review** — Spawns mechanically after each implementation. Read-only code review specialist. Reads the same plan/step files and reviews the latest commit (`git show HEAD`) against the step's acceptance criteria.
 
 ### Key Types
 
-- `SubAgent<P, R>` — base class for an agent definition (name, description, tools, system prompt, task formatter, result extractor)
-- `ResultPayload` — JSON sent by child on completion or takeover (id, agent, tmuxWindow, success, takenOver, stopReason, summary, timestamp)
+- `SubAgent<P>` — base class for an agent definition (name, description, tools, system prompt, task formatter)
+- `ResultPayload` — JSON sent by plan and implement children: `{ id }`
+- `ReviewResultPayload` — extends `ResultPayload` with `verdict: "pass" | "changes-needed"`, sent by review children
+- `PipelineState` — tracks the mechanical pipeline: `{ slug, totalSteps, currentStep, cwd }`
 
 ### Lifecycle
 
-1. LLM calls an agent's tool → parent writes the task file, creates a tmux window, and `send-keys` a `pi --agent <name> --subagent-id <id> --subagent-socket <path> [--subagent-plan-slug <slug>] @<taskPath>` command into it
-2. Child starts in an isolated pi session, applies the agent's system prompt via `before_agent_start`, and reads the task from the task file
-3. On `agent_end`: if clean completion (`stopReason === "stop"` + no pending messages), child sends a success `ResultPayload` over the socket and shuts down. If the human interrupted, child sends `takenOver: true` and stays alive as an interactive pi (with a `report` tool if the run was aborted).
-4. Parent's socket connection handler parses the JSON line and delivers a `fork-result` notification → triggers a new parent turn
-5. Clean completions automatically close the subagent's tmux window and remove its task file
+1. LLM calls the `plan` tool → parent writes the task file, creates a tmux window, and `send-keys` a `pi --agent plan ...` command into it
+2. Child starts in an isolated pi session, applies the plan system prompt via `before_agent_start`, and reads the task from the task file
+3. Plan agent writes plan.md and step files, then calls `done` → sends `{ id }` over the socket
+4. Parent's `deliverResult` sees a `PlanAgent` completed → calls `startPipeline`, which reads the plan directory to count steps and spawns an `implement` agent for step 1
+5. Implement agent commits the change and calls `done` → parent's `deliverResult` sees an `ImplementAgent` completed → calls `handleImplementComplete`, which spawns a `review` agent for that step
+6. Review agent calls `write_review` (stores verdict in closure) then `done` → sends `ReviewResultPayload { id, verdict }` over the socket
+7. Parent's `deliverResult` sees a `ReviewAgent` completed → calls `handleReviewComplete`:
+   - If verdict is `"pass"`: advances to next step (spawns implement) or completes the pipeline if all steps done
+   - If verdict is `"changes-needed"`: stops the pipeline and notifies the LLM
+8. Clean completions automatically close the subagent's tmux window and remove its task file
 
 ### Lifecycle hooks
 
@@ -93,9 +98,9 @@ The plan directory defaults to `plans/` but can be overridden with the `FORK_PLA
 ## Making Changes
 
 - To modify an agent: edit its entry in the `AGENTS` array in `index.ts`.
-- To modify tool behavior: edit the `execute` callback in `setupParent`'s `registerTool` call.
-- To change result delivery: edit `Dispatcher.deliverResult` (parent) or `sendResult` in `setupChild` (child).
-
+- To modify tool behavior: edit the `execute` callback in the corresponding `registerTool` call.
+- To change the pipeline: edit `Dispatcher.deliverResult`, `startPipeline`, `spawnImplementStep`, `handleImplementComplete`, or `handleReviewComplete`.
+- To change result delivery: edit `Dispatcher.deliverResult` (parent) or the `done` tool in `setupChild` (child).
 
 ## Install & Run
 
