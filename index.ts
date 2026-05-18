@@ -101,72 +101,7 @@ interface State {
 	pipeline: Pipeline | null;
 }
 
-// ── system prompts ──────────────────────────────────────────────────
-
-const PLAN_PROMPT = [
-	"You are a planning specialist. Read the codebase, understand the goal,",
-	"and write a plan as a directory of files under the path given in the task.",
-	"",
-	"Use `write_plan` once to create the overview file (plan.md).",
-	"Use `write_step` to create individual step files — they are auto-numbered.",
-	"You may also use read-only tools. Do not modify any other file.",
-	"",
-	"Before writing, think through:",
-	"- Current state: what exists, key files and their responsibilities.",
-	"- Strategy: how to get from here to the goal, and why this approach.",
-	"- Risks: what could go wrong.",
-	"",
-	"Overview (plan.md) format:",
-	"",
-	"```",
-	"# Plan: <slug>",
-	"",
-	"## Goal",
-	"<what someone can do after this change that they can't do now>",
-	"",
-	"## Context",
-	"<brief orientation: key files, how they fit together, what the implementer needs to know>",
-	"",
-	"## Steps",
-	"1. **<file>** — <what changes>",
-	"   - acceptance: <observable behavior — a command, test, or output>",
-	"2. ...",
-	"",
-	"## Risks",
-	"<things to watch for>",
-	"```",
-	"",
-	"Each step file (step-NNN.md) must be self-contained: include everything",
-	"the implementer needs without reading other steps. Name exact files,",
-	"functions, types, and signatures. Write acceptance as observable behavior",
-	"('test X passes', 'command outputs Y') — not internal state ('added a struct').",
-	"Keep each step to one meaningful commit.",
-	"",
-	"When done, call `implement`.",
-].join("\n");
-
-const IMPLEMENT_PROMPT = [
-	"You are an implementation specialist. Implement exactly one step of a",
-	"plan — not more.",
-	"",
-	"- Implement only the step described in the task.",
-	"- Call `commit` when done with a one-line summary of what changed.",
-	"  Pre-commit hooks (type-check, lint, tests) must pass.",
-	"  If a hook fails, fix the underlying issue and re-commit — don't bypass.",
-].join("\n");
-
-const REVIEW_PROMPT = [
-	"You are a code reviewer. You judge whether one step of a plan was",
-	"implemented correctly. Pre-commit hooks already ran — don't re-run",
-	"linters, type-checks, or tests. Focus on judgment:",
-	"",
-	"- Does the diff match the step's acceptance criterion?",
-	"- Design problems, missed edge cases, security issues, inconsistency.",
-	"",
-	"Use `bash` for `git show HEAD` and `git diff` only.",
-	"",
-	"When done, call `review` with your verdict and issues.",
-].join("\n");
+const PROMPTS_DIR = path.join(__dirname, "prompts");
 
 const READ_ONLY = ["read", "grep", "find", "ls"];
 
@@ -481,7 +416,9 @@ function setupPlanChild(
 			"fork: plan agent missing required --subagent-plan-slug flag",
 		);
 
-	pi.on("before_agent_start", () => ({ systemPrompt: PLAN_PROMPT }));
+	pi.on("before_agent_start", () => ({
+		systemPrompt: fs.readFileSync(path.join(PROMPTS_DIR, "plan.md"), "utf-8"),
+	}));
 
 	const planDir = planDirFor(slug);
 	let stepCounter = 0;
@@ -562,7 +499,12 @@ function setupImplementChild(
 	id: string,
 	socketPath: string,
 ): void {
-	pi.on("before_agent_start", () => ({ systemPrompt: IMPLEMENT_PROMPT }));
+	pi.on("before_agent_start", () => ({
+		systemPrompt: fs.readFileSync(
+			path.join(PROMPTS_DIR, "implement.md"),
+			"utf-8",
+		),
+	}));
 
 	pi.registerTool({
 		name: "commit",
@@ -595,7 +537,9 @@ function setupReviewChild(
 	id: string,
 	socketPath: string,
 ): void {
-	pi.on("before_agent_start", () => ({ systemPrompt: REVIEW_PROMPT }));
+	pi.on("before_agent_start", () => ({
+		systemPrompt: fs.readFileSync(path.join(PROMPTS_DIR, "review.md"), "utf-8"),
+	}));
 
 	pi.registerTool({
 		name: "review",
