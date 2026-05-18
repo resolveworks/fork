@@ -8,8 +8,7 @@
  * Children are spawned as separate `pi` processes in new tmux windows.
  * The parent's tool call returns immediately; results are delivered
  * back as a `fork-result` notification message that triggers a new
- * turn. If the human takes over the child's tmux window (typing, Esc,
- * queued message), the child reports `takenOver` and stays alive.
+ * turn. Subagents call the `done` tool when finished.
  *
  * Requires: run pi inside tmux.
  */
@@ -19,7 +18,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 
 // ── tmux ────────────────────────────────────────────────────────────
@@ -59,7 +58,7 @@ interface ResultPayload {
 
 // ── SubAgent base ───────────────────────────────────────────────────
 
-abstract class SubAgent<P, R> {
+abstract class SubAgent<P> {
 	abstract readonly name: string;
 	abstract readonly description: string;
 	abstract readonly tools: readonly string[]; // empty = no restriction
@@ -70,9 +69,6 @@ abstract class SubAgent<P, R> {
 
 	/** Build the initial task message the child sees, from typed params. */
 	abstract formatTask(params: P): string;
-
-	/** Extract the typed result after child completion. */
-	abstract extractResult(params: P): R;
 
 	/** Parent: register this agent as its own pi tool. */
 	registerTool(pi: ExtensionAPI, dispatcher: Dispatcher): void {
@@ -92,7 +88,7 @@ abstract class SubAgent<P, R> {
 			systemPrompt: this.systemPrompt(),
 		}));
 		if (this.tools.length > 0) {
-			pi.setActiveTools([...this.tools, "report"]);
+			pi.setActiveTools([...this.tools, "done"]);
 		}
 	}
 }
@@ -102,8 +98,7 @@ abstract class SubAgent<P, R> {
 const READ_ONLY = ["read", "grep", "find", "ls"] as const;
 
 class PlanAgent extends SubAgent<
-	{ goal: string; slug: string },
-	{ planDir: string }
+	{ goal: string; slug: string }
 > {
 	readonly name = "plan";
 	readonly description =
@@ -145,23 +140,18 @@ class PlanAgent extends SubAgent<
 			"Each step file (step-NNN.md) must be small enough that a single subagent",
 			"can implement it with only the named file(s) loaded. Spell out paths,",
 			"signatures, imports, and acceptance criteria.",
+			"",
+			"When done, call `done`.",
 		].join("\n");
 	}
 
 	formatTask({ goal, slug }: { goal: string; slug: string }): string {
 		return `Write a plan for the following goal. Save plan.md and step files under ${planDirFor(slug)}/.\n\nGoal: ${goal}`;
 	}
-
-	extractResult(
-		{ slug }: { goal: string; slug: string },
-	): { planDir: string } {
-		return { planDir: planDirFor(slug) };
-	}
 }
 
 class ImplementAgent extends SubAgent<
-	{ plan: string; step: number },
-	{ commit: string }
+	{ plan: string; step: number }
 > {
 	readonly name = "implement";
 	readonly description =
@@ -182,6 +172,7 @@ class ImplementAgent extends SubAgent<
 			"- Commit when done. Pre-commit hooks (type-check, lint, tests) must pass.",
 			"  If a hook fails, fix the underlying issue and re-commit — don't bypass.",
 			"- Output a one-line summary of what changed.",
+			"- When done, call `done`.",
 		].join("\n");
 	}
 
@@ -208,20 +199,6 @@ class ImplementAgent extends SubAgent<
 			stepContent,
 		].join("\n");
 	}
-
-	extractResult(
-		_params: { plan: string; step: number },
-	): { commit: string } {
-		try {
-			return {
-				commit: execSync("git rev-parse HEAD", {
-					encoding: "utf-8",
-				}).trim(),
-			};
-		} catch {
-			return { commit: "" };
-		}
-	}
 }
 
 interface ReviewIssue {
@@ -231,8 +208,7 @@ interface ReviewIssue {
 }
 
 class ReviewAgent extends SubAgent<
-	{ plan: string; step: number; commit: string },
-	{ verdict: "pass" | "changes-needed"; issues: ReviewIssue[] }
+	{ plan: string; step: number; commit: string }
 > {
 	readonly name = "review";
 	readonly description =
@@ -243,10 +219,6 @@ class ReviewAgent extends SubAgent<
 		step: Type.Number({ description: "Step number to review" }),
 		commit: Type.String({ description: "Commit SHA implementing the step" }),
 	});
-
-	/** Stored by the write_review tool call. */
-	lastReview: { verdict: "pass" | "changes-needed"; issues: ReviewIssue[] } | null =
-		null;
 
 	systemPrompt(): string {
 		return [
@@ -259,7 +231,7 @@ class ReviewAgent extends SubAgent<
 			"",
 			"Use `bash` for `git show <commit>` and `git diff` only.",
 			"",
-			"When done, call `write_review` with your verdict and issues.",
+			"When done, call `write_review` with your verdict and issues, then call `done`.",
 		].join("\n");
 	}
 
@@ -294,27 +266,14 @@ class ReviewAgent extends SubAgent<
 			`Inspect the diff with \`git show ${commit}\`.`,
 			"Judge whether the commit meets the step's intent and acceptance.",
 			"Call `write_review` with your verdict and any issues.",
+			"Then call `done`.",
 		].join("\n");
-	}
-
-	extractResult(
-		_params: { plan: string; step: number; commit: string },
-	): { verdict: "pass" | "changes-needed"; issues: ReviewIssue[] } {
-		if (!this.lastReview) {
-			return {
-				verdict: "changes-needed",
-				issues: [
-					{ file: "", line: 0, issue: "Reviewer did not call write_review" },
-				],
-			};
-		}
-		return this.lastReview;
 	}
 }
 
 // ── registry ────────────────────────────────────────────────────────
 
-const agents: SubAgent<any, any>[] = [
+const agents: SubAgent<any>[] = [
 	new PlanAgent(),
 	new ImplementAgent(),
 	new ReviewAgent(),
@@ -324,8 +283,7 @@ const agentByName = new Map(agents.map((a) => [a.name, a]));
 // ── parent: dispatcher ──────────────────────────────────────────────
 
 class Dispatcher {
-	private active = new Map<string, { agent: SubAgent<any, any>; params: any; tmuxWindow: string }>();
-	private finalized = new Set<string>();
+	private active = new Map<string, { agent: SubAgent<any>; params: any; tmuxWindow: string }>();
 	private session: string;
 	private currentSessionId: string | null = null;
 
@@ -337,8 +295,8 @@ class Dispatcher {
 		this.currentSessionId = id;
 	}
 
-	spawn<P, R>(
-		agent: SubAgent<P, R>,
+	spawn<P>(
+		agent: SubAgent<P>,
 		params: P,
 		ctx: { cwd: string },
 	): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
@@ -386,34 +344,21 @@ class Dispatcher {
 	}
 
 	deliverResult(payload: ResultPayload): void {
-		if (this.finalized.has(payload.id)) return;
-
 		const slot = this.active.get(payload.id);
 		if (!slot) throw new Error(`fork: deliverResult called for unknown agent ${payload.id}`);
-		const { tmuxWindow } = slot;
-
-		const content = this.formatDelivery(slot);
 
 		this.pi.sendMessage(
 			{
 				customType: RESULT_TYPE,
-				content,
+				content: `Subagent **${slot.agent.name}** completed.`,
 				display: true,
 			},
 			{ triggerTurn: true },
 		);
 
-		this.finalized.add(payload.id);
 		this.active.delete(payload.id);
-		execSync(`tmux kill-window -t ${this.session}:${tmuxWindow}`, { encoding: "utf-8", timeout: 3000 });
+		execSync(`tmux kill-window -t ${this.session}:${slot.tmuxWindow}`, { encoding: "utf-8", timeout: 3000 });
 		fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
-	}
-
-	private formatDelivery(
-		slot: { agent: SubAgent<any, any>; params: any; tmuxWindow: string },
-	): string {
-		const typed = slot.agent.extractResult(slot.params);
-		return `Subagent **${slot.agent.name}** completed:\n\n\`\`\`json\n${JSON.stringify(typed, null, 2)}\n\`\`\``;
 	}
 }
 
@@ -464,7 +409,7 @@ function setupParent(pi: ExtensionAPI): void {
 
 // ── child role ──────────────────────────────────────────────────────
 
-function setupChild(pi: ExtensionAPI, agent: SubAgent<any, any>): void {
+function setupChild(pi: ExtensionAPI, agent: SubAgent<any>): void {
 	const id = pi.getFlag("subagent-id") as string | undefined;
 	const socketPath = pi.getFlag("subagent-socket") as string | undefined;
 	if (!id) throw new Error("fork: subagent missing required --subagent-id flag");
@@ -517,7 +462,7 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any, any>): void {
 			},
 		});
 
-		pi.setActiveTools([...agent.tools, "write_plan", "write_step", "report"]);
+		pi.setActiveTools([...agent.tools, "write_plan", "write_step", "done"]);
 	}
 
 	if (agent instanceof ReviewAgent) {
@@ -545,7 +490,6 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any, any>): void {
 					verdict: "pass" | "changes-needed";
 					issues: ReviewIssue[];
 				};
-				agent.lastReview = { verdict, issues };
 				return {
 					content: [
 						{
@@ -557,108 +501,24 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any, any>): void {
 			},
 		});
 
-		pi.setActiveTools([...agent.tools, "report"]);
+		pi.setActiveTools([...agent.tools, "write_review", "done"]);
 	}
 
-	let delivered = false;
-	let aborted = false;
-
-	const sendResult = (
-		partial: Pick<
-			ResultPayload,
-			"success" | "takenOver" | "stopReason" | "summary"
-		>,
-		onSent?: () => void,
-	) => {
-		if (delivered) {
-			onSent?.();
-			return;
-		}
-		delivered = true;
-		const payload: ResultPayload = {
-			id,
-			agent: agent.name,
-			timestamp: Date.now(),
-			...partial,
-		};
-		const socket = net.connect(socketPath);
-		socket.on("error", (err) => {
-			throw err;
-		});
-		socket.end(`${JSON.stringify(payload)}\n`, () => {
-			onSent?.();
-		});
-	};
-
-	pi.on("agent_start", () => {
-		if (!aborted) delivered = false;
-	});
-
-	pi.on("agent_end", (event, ctx: ExtensionContext) => {
-		if (delivered) return;
-
-		const last = [...event.messages].reverse().find((m) => m.role === "assistant") as
-			| { role: "assistant"; content: any[]; stopReason?: string }
-			| undefined;
-		const stopReason = last?.stopReason ?? "unknown";
-
-		const cleanCompletion = stopReason === "stop" && !ctx.hasPendingMessages();
-
-		if (cleanCompletion) {
-			const summary = (last?.content ?? [])
-				.filter((c: any) => c.type === "text")
-				.map((c: any) => c.text)
-				.join("\n");
-			sendResult(
-				{ success: true, takenOver: false, stopReason, summary },
-				() => ctx.shutdown(),
+	pi.registerTool({
+		name: "done",
+		label: "Done",
+		description:
+			"Report completion to the parent session and close this subagent. " +
+			"Call when your task is complete.",
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const socket = net.connect(socketPath);
+			socket.on("error", (err) => { throw err; });
+			socket.end(`${JSON.stringify({ id })}\n`, () =>
+				ctx.shutdown(),
 			);
-			return;
-		}
-
-		// Steer: user typed while running. takenOver result now; agent_start
-		// will reset `delivered` so the next clean completion supersedes it.
-		if (ctx.hasPendingMessages()) {
-			sendResult({ success: false, takenOver: true, stopReason, summary: "" });
-			return;
-		}
-
-		// Abort: Esc, no pending messages. Hand the human a `report()` tool.
-		aborted = true;
-		sendResult({ success: false, takenOver: true, stopReason, summary: "" });
-
-		pi.registerTool({
-			name: "report",
-			label: "Report",
-			description:
-				"Report findings back to the parent session and close this subagent window. " +
-				"Call this when the human instructs you to report back.",
-			parameters: Type.Object({
-				summary: Type.String({
-					description: "Summary of findings to report to the parent",
-				}),
-			}),
-			async execute(_toolCallId, params, _signal, _onUpdate, toolCtx) {
-				delivered = false;
-				await new Promise<void>((resolve) => {
-					sendResult(
-						{
-							success: true,
-							takenOver: false,
-							stopReason: "report",
-							summary: (params as { summary: string }).summary,
-						},
-						resolve,
-					);
-				});
-				toolCtx.shutdown();
-				return {
-					content: [
-						{ type: "text", text: "Reported findings to parent session." },
-					],
-				};
-			},
-		});
+			return { content: [{ type: "text", text: "Done." }] };
+		},
 	});
 }
 
