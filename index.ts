@@ -24,13 +24,7 @@ import { Type, type TSchema } from "typebox";
 
 // ── tmux ────────────────────────────────────────────────────────────
 
-function tmux(cmd: string): string {
-	try {
-		return execSync(`tmux ${cmd}`, { encoding: "utf-8", timeout: 3000 }).trim();
-	} catch {
-		return "";
-	}
-}
+
 
 function inTmux(): boolean {
 	return !!process.env.TMUX;
@@ -67,12 +61,7 @@ interface ResultPayload {
 	timestamp: number;
 }
 
-interface ChildCompletion {
-	success: boolean;
-	takenOver: boolean;
-	stopReason: string;
-	summary: string;
-}
+
 
 // ── SubAgent base ───────────────────────────────────────────────────
 
@@ -88,8 +77,8 @@ abstract class SubAgent<P, R> {
 	/** Build the initial task message the child sees, from typed params. */
 	abstract formatTask(params: P): string;
 
-	/** Parse the child's raw completion into a typed result. */
-	abstract extractResult(raw: ChildCompletion, params: P): R;
+	/** Extract the typed result after child completion. */
+	abstract extractResult(params: P): R;
 
 	/** Parent: register this agent as its own pi tool. */
 	registerTool(pi: ExtensionAPI, dispatcher: Dispatcher): void {
@@ -170,7 +159,6 @@ class PlanAgent extends SubAgent<
 	}
 
 	extractResult(
-		_raw: ChildCompletion,
 		{ slug }: { goal: string; slug: string },
 	): { planDir: string } {
 		return { planDir: planDirFor(slug) };
@@ -228,7 +216,6 @@ class ImplementAgent extends SubAgent<
 	}
 
 	extractResult(
-		_raw: ChildCompletion,
 		_params: { plan: string; step: number },
 	): { commit: string } {
 		try {
@@ -255,13 +242,17 @@ class ReviewAgent extends SubAgent<
 > {
 	readonly name = "review";
 	readonly description =
-		"Review a step's commit against its acceptance criteria. Returns a structured verdict.";
-	readonly tools = [...READ_ONLY, "bash"] as const;
+		"Read-only code review specialist. Reads plan/step files and reviews the commit against the step's acceptance criteria.";
+	readonly tools = [...READ_ONLY, "bash", "write_review"] as const;
 	readonly params = Type.Object({
 		plan: Type.String({ description: "Plan slug (e.g. dark-mode)" }),
-		step: Type.Number({ description: "Step number that was implemented" }),
+		step: Type.Number({ description: "Step number to review" }),
 		commit: Type.String({ description: "Commit SHA implementing the step" }),
 	});
+
+	/** Stored by the write_review tool call. */
+	lastReview: { verdict: "pass" | "changes-needed"; issues: ReviewIssue[] } | null =
+		null;
 
 	systemPrompt(): string {
 		return [
@@ -274,17 +265,7 @@ class ReviewAgent extends SubAgent<
 			"",
 			"Use `bash` for `git show <commit>` and `git diff` only.",
 			"",
-			"End your response with exactly this block, and nothing after it:",
-			"",
-			"```verdict",
-			"verdict: pass | changes-needed",
-			"issues:",
-			"  - file: path/to/file.ts",
-			"    line: 42",
-			"    issue: short description",
-			"```",
-			"",
-			"If there are no issues, leave the `issues:` list empty.",
+			"When done, call `write_review` with your verdict and issues.",
 		].join("\n");
 	}
 
@@ -318,42 +299,23 @@ class ReviewAgent extends SubAgent<
 			"",
 			`Inspect the diff with \`git show ${commit}\`.`,
 			"Judge whether the commit meets the step's intent and acceptance.",
-			"Emit the verdict block per the system prompt.",
+			"Call `write_review` with your verdict and any issues.",
 		].join("\n");
 	}
 
 	extractResult(
-		raw: ChildCompletion,
 		_params: { plan: string; step: number; commit: string },
 	): { verdict: "pass" | "changes-needed"; issues: ReviewIssue[] } {
-		return parseVerdictBlock(raw.summary);
+		if (!this.lastReview) {
+			return {
+				verdict: "changes-needed",
+				issues: [
+					{ file: "", line: 0, issue: "Reviewer did not call write_review" },
+				],
+			};
+		}
+		return this.lastReview;
 	}
-}
-
-function parseVerdictBlock(text: string): {
-	verdict: "pass" | "changes-needed";
-	issues: ReviewIssue[];
-} {
-	const block = text.match(/```verdict\s*\n([\s\S]*?)```/);
-	if (!block) {
-		return {
-			verdict: "changes-needed",
-			issues: [
-				{ file: "", line: 0, issue: "Reviewer did not emit a verdict block" },
-			],
-		};
-	}
-	const body = block[1];
-	const v = body.match(/verdict:\s*(pass|changes-needed)/);
-	const verdict = (v?.[1] ?? "changes-needed") as "pass" | "changes-needed";
-
-	const issues: ReviewIssue[] = [];
-	const re = /-\s*file:\s*(\S+)\s*\n\s*line:\s*(\d+)\s*\n\s*issue:\s*(.+)/g;
-	let m: RegExpExecArray | null;
-	while ((m = re.exec(body)) !== null) {
-		issues.push({ file: m[1], line: Number(m[2]), issue: m[3].trim() });
-	}
-	return { verdict, issues };
 }
 
 // ── registry ────────────────────────────────────────────────────────
@@ -374,7 +336,7 @@ class Dispatcher {
 	private currentSessionId: string | null = null;
 
 	constructor(private pi: ExtensionAPI) {
-		this.session = tmux("display-message -p '#S'");
+		this.session = execSync("tmux display-message -p '#S'", { encoding: "utf-8", timeout: 3000 }).trim();
 	}
 
 	setSessionId(id: string): void {
@@ -395,16 +357,11 @@ class Dispatcher {
 		const taskPath = path.join(TASKS_DIR, `${id}.md`);
 		fs.writeFileSync(taskPath, agent.formatTask(params), { mode: 0o600 });
 
-		const win = tmux(
-			`new-window -t ${this.session} -n ${id} -c ${ctx.cwd} -P -F '#I'`,
-		);
-		if (!win) {
-			return {
-				content: [{ type: "text", text: "Failed to create tmux window." }],
-				isError: true,
-			};
-		}
-		tmux(`set-option -t ${this.session}:${win} -w remain-on-exit off`);
+		const win = execSync(
+			`tmux new-window -t ${this.session} -n ${id} -c ${ctx.cwd} -P -F '#I'`,
+			{ encoding: "utf-8", timeout: 3000 },
+		).trim();
+		execSync(`tmux set-option -t ${this.session}:${win} -w remain-on-exit off`, { encoding: "utf-8", timeout: 3000 });
 
 		const cmdParts = [
 			"pi",
@@ -420,7 +377,7 @@ class Dispatcher {
 		}
 		cmdParts.push(`@${taskPath}`);
 		const cmd = cmdParts.join(" ");
-		tmux(`send-keys -t ${this.session}:${win} ${JSON.stringify(cmd)} Enter`);
+		execSync(`tmux send-keys -t ${this.session}:${win} ${JSON.stringify(cmd)} Enter`, { encoding: "utf-8", timeout: 3000 });
 
 		this.active.set(id, { agent, params, tmuxWindow: win });
 
@@ -438,7 +395,8 @@ class Dispatcher {
 		if (this.finalized.has(payload.id)) return;
 
 		const slot = this.active.get(payload.id);
-		const tmuxWindow = slot?.tmuxWindow ?? "";
+		if (!slot) throw new Error(`fork: deliverResult called for unknown agent ${payload.id}`);
+		const { tmuxWindow } = slot;
 
 		const message = this.formatDelivery(payload, slot);
 
@@ -455,45 +413,26 @@ class Dispatcher {
 		if (!payload.takenOver) {
 			this.finalized.add(payload.id);
 			this.active.delete(payload.id);
-			if (tmuxWindow) {
-				tmux(`kill-window -t ${this.session}:${tmuxWindow}`);
-			}
+			execSync(`tmux kill-window -t ${this.session}:${tmuxWindow}`, { encoding: "utf-8", timeout: 3000 });
 			fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
 		}
 	}
 
 	private formatDelivery(
 		data: ResultPayload,
-		slot: { agent: SubAgent<any, any>; params: any; tmuxWindow: string } | undefined,
+		slot: { agent: SubAgent<any, any>; params: any; tmuxWindow: string },
 	): {
 		content: string;
 		details: unknown;
 	} {
 		if (data.takenOver) {
-			const tmuxWindow = slot?.tmuxWindow ?? "";
 			return {
-				content: `Subagent **${data.agent}** (window ${tmuxWindow}) was taken over — no findings returned. (stopReason: ${data.stopReason})`,
+				content: `Subagent **${data.agent}** (window ${slot.tmuxWindow}) was taken over — no findings returned. (stopReason: ${data.stopReason})`,
 				details: data,
 			};
 		}
 
-		if (!slot) {
-			// Orphaned result (e.g. recovered after restart) — deliver raw.
-			return {
-				content: `Subagent **${data.agent}** completed:\n\n${data.summary || "(no output)"}`,
-				details: data,
-			};
-		}
-
-		const typed = slot.agent.extractResult(
-			{
-				success: data.success,
-				takenOver: data.takenOver,
-				stopReason: data.stopReason,
-				summary: data.summary,
-			},
-			slot.params,
-		);
+		const typed = slot.agent.extractResult(slot.params);
 
 		return {
 			content: `Subagent **${data.agent}** completed:\n\n\`\`\`json\n${JSON.stringify(typed, null, 2)}\n\`\`\``,
@@ -603,6 +542,46 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any, any>): void {
 		});
 
 		pi.setActiveTools([...agent.tools, "write_plan", "write_step", "report"]);
+	}
+
+	if (agent instanceof ReviewAgent) {
+		pi.registerTool({
+			name: "write_review",
+			label: "Write Review",
+			description:
+				"Submit your review verdict and issues. Call once when done.",
+			parameters: Type.Object({
+				verdict: Type.Union(
+					[Type.Literal("pass"), Type.Literal("changes-needed")],
+					{ description: "Whether the step passes review" },
+				),
+				issues: Type.Array(
+					Type.Object({
+						file: Type.String({ description: "File path" }),
+						line: Type.Number({ description: "Line number" }),
+						issue: Type.String({ description: "Short description" }),
+					}),
+					{ description: "Issues found (empty if verdict is pass)" },
+				),
+			}),
+			async execute(_id, params) {
+				const { verdict, issues } = params as {
+					verdict: "pass" | "changes-needed";
+					issues: ReviewIssue[];
+				};
+				agent.lastReview = { verdict, issues };
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Review recorded: ${verdict} (${issues.length} issue${issues.length === 1 ? "" : "s"})`,
+						},
+					],
+				};
+			},
+		});
+
+		pi.setActiveTools([...agent.tools, "report"]);
 	}
 
 	let delivered = false;
