@@ -47,6 +47,14 @@ function socketPathFor(parentSessionId: string): string {
 	return path.join(SOCKETS_DIR, `${parentSessionId}.sock`);
 }
 
+function planBaseDir(): string {
+	return process.env.FORK_PLANS_DIR ?? "plans";
+}
+
+function planDirFor(slug: string): string {
+	return path.join(planBaseDir(), slug);
+}
+
 // ── result payload (sent by child over socket, parsed by parent) ────
 
 interface ResultPayload {
@@ -112,28 +120,29 @@ const READ_ONLY = ["read", "grep", "find", "ls"] as const;
 
 class PlanAgent extends SubAgent<
 	{ goal: string; slug: string },
-	{ planPath: string }
+	{ planDir: string }
 > {
 	readonly name = "plan";
 	readonly description =
-		"Create an implementation plan. Reads the codebase and writes plans/<slug>.md.";
-	readonly tools = [...READ_ONLY, "write"] as const;
+		"Create an implementation plan. Reads the codebase and writes plans/<slug>/plan.md + step files.";
+	readonly tools = [...READ_ONLY, "write_plan", "write_step"] as const;
 	readonly params = Type.Object({
 		goal: Type.String({ description: "What the plan should accomplish" }),
 		slug: Type.String({
-			description: "Filename slug; plan is saved to plans/<slug>.md",
+			description: "Filename slug; plan is saved to plans/<slug>/",
 		}),
 	});
 
 	systemPrompt(): string {
 		return [
 			"You are a planning specialist. Read the codebase, understand the goal,",
-			"and write a plan file at the path given in the task.",
+			"and write a plan as a directory of files under the path given in the task.",
 			"",
-			"You may use read-only tools and `write` for the plan file only. Do not",
-			"modify any other file.",
+			"Use `write_plan` once to create the overview file (plan.md).",
+			"Use `write_step` to create individual step files — they are auto-numbered.",
+			"You may also use read-only tools. Do not modify any other file.",
 			"",
-			"Plan format:",
+			"Overview (plan.md) format:",
 			"",
 			"```",
 			"# Plan: <slug>",
@@ -150,20 +159,21 @@ class PlanAgent extends SubAgent<
 			"<things to watch for>",
 			"```",
 			"",
-			"Each step must be small enough that a single subagent can implement it",
-			"with only the named file(s) loaded. Spell out paths, signatures, imports.",
+			"Each step file (step-NNN.md) must be small enough that a single subagent",
+			"can implement it with only the named file(s) loaded. Spell out paths,",
+			"signatures, imports, and acceptance criteria.",
 		].join("\n");
 	}
 
 	formatTask({ goal, slug }: { goal: string; slug: string }): string {
-		return `Write a plan for the following goal and save it to plans/${slug}.md.\n\nGoal: ${goal}`;
+		return `Write a plan for the following goal. Save plan.md and step files under ${planDirFor(slug)}/.\n\nGoal: ${goal}`;
 	}
 
 	extractResult(
 		_raw: ChildCompletion,
 		{ slug }: { goal: string; slug: string },
-	): { planPath: string } {
-		return { planPath: `plans/${slug}.md` };
+	): { planDir: string } {
+		return { planDir: planDirFor(slug) };
 	}
 }
 
@@ -174,9 +184,10 @@ class ImplementAgent extends SubAgent<
 	readonly name = "implement";
 	readonly description =
 		"Implement a single step from a plan. Commits on the current branch.";
+	// `plan` param is a slug (e.g. "dark-mode"); paths are constructed internally.
 	readonly tools: readonly string[] = []; // unrestricted
 	readonly params = Type.Object({
-		plan: Type.String({ description: "Path to the plan file" }),
+		plan: Type.String({ description: "Plan slug (e.g. dark-mode)" }),
 		step: Type.Number({ description: "Step number to implement" }),
 	});
 
@@ -185,8 +196,9 @@ class ImplementAgent extends SubAgent<
 			"You are an implementation specialist. Implement exactly one step of a",
 			"plan — not more.",
 			"",
-			"- Read the plan file specified in the task.",
-			"- Find the named step. Implement only that step's changes.",
+			"- Read plans/<slug>/plan.md for the overview.",
+			"- Read plans/<slug>/step-NNN.md for your specific step.",
+			"- Implement only that step's changes.",
 			"- Commit when done. Pre-commit hooks (type-check, lint, tests) must pass.",
 			"  If a hook fails, fix the underlying issue and re-commit — don't bypass.",
 			"- Output a one-line summary of what changed.",
@@ -194,7 +206,15 @@ class ImplementAgent extends SubAgent<
 	}
 
 	formatTask({ plan, step }: { plan: string; step: number }): string {
-		return `Implement step ${step} of ${plan}. Read the plan, find step ${step}, implement only that step, then commit.`;
+		const padded = String(step).padStart(3, "0");
+		const dir = planDirFor(plan);
+		return [
+			`Implement step ${step} of the plan "${plan}".`,
+			"",
+			`1. Read ${dir}/plan.md for the overview.`,
+			`2. Read ${dir}/step-${padded}.md for the specific step.`,
+			"3. Implement only that step, then commit.",
+		].join("\n");
 	}
 
 	extractResult(
@@ -228,7 +248,7 @@ class ReviewAgent extends SubAgent<
 		"Review a step's commit against its acceptance criteria. Returns a structured verdict.";
 	readonly tools = [...READ_ONLY, "bash"] as const;
 	readonly params = Type.Object({
-		plan: Type.String({ description: "Path to the plan file" }),
+		plan: Type.String({ description: "Plan slug (e.g. dark-mode)" }),
 		step: Type.Number({ description: "Step number that was implemented" }),
 		commit: Type.String({ description: "Commit SHA implementing the step" }),
 	});
@@ -239,6 +259,8 @@ class ReviewAgent extends SubAgent<
 			"implemented correctly. Pre-commit hooks already ran — don't re-run",
 			"linters, type-checks, or tests. Focus on judgment:",
 			"",
+			"- Read plans/<slug>/plan.md for the overview and plans/<slug>/step-NNN.md",
+			"  for the specific step's acceptance criteria.",
 			"- Does the diff match the step's acceptance criterion?",
 			"- Design problems, missed edge cases, security issues, inconsistency.",
 			"",
@@ -263,13 +285,16 @@ class ReviewAgent extends SubAgent<
 		step,
 		commit,
 	}: { plan: string; step: number; commit: string }): string {
+		const padded = String(step).padStart(3, "0");
+		const dir = planDirFor(plan);
 		return [
-			`Review commit ${commit}, which implements step ${step} of ${plan}.`,
+			`Review commit ${commit}, which implements step ${step} of plan "${plan}".`,
 			"",
-			`1. Read ${plan} and find step ${step}, including its acceptance.`,
-			`2. Inspect the diff with \`git show ${commit}\`.`,
-			`3. Judge whether the commit meets the step's intent and acceptance.`,
-			`4. Emit the verdict block per the system prompt.`,
+			`1. Read ${dir}/plan.md for the overview.`,
+			`2. Read ${dir}/step-${padded}.md for the step's acceptance criteria.`,
+			`3. Inspect the diff with \`git show ${commit}\`.`,
+			`4. Judge whether the commit meets the step's intent and acceptance.`,
+			`5. Emit the verdict block per the system prompt.`,
 		].join("\n");
 	}
 
@@ -357,7 +382,7 @@ class Dispatcher {
 		}
 		tmux(`set-option -t ${this.session}:${win} -w remain-on-exit off`);
 
-		const cmd = [
+		const cmdParts = [
 			"pi",
 			"--agent",
 			agent.name,
@@ -365,8 +390,12 @@ class Dispatcher {
 			id,
 			"--subagent-socket",
 			socketPathFor(this.currentSessionId),
-			`@${taskPath}`,
-		].join(" ");
+		];
+		if (agent instanceof PlanAgent) {
+			cmdParts.push("--subagent-plan-slug", (params as { slug: string }).slug);
+		}
+		cmdParts.push(`@${taskPath}`);
+		const cmd = cmdParts.join(" ");
 		tmux(`send-keys -t ${this.session}:${win} ${JSON.stringify(cmd)} Enter`);
 
 		this.active.set(id, { agent, params, tmuxWindow: win });
@@ -505,6 +534,53 @@ function setupChild(pi: ExtensionAPI, agent: SubAgent<any, any>): void {
 
 	agent.setupChild(pi);
 
+	// Register plan-specific tools for PlanAgent
+	if (agent instanceof PlanAgent) {
+		const slug = pi.getFlag("subagent-plan-slug") as string | undefined;
+		if (!slug) throw new Error("fork: plan agent missing required --subagent-plan-slug flag");
+
+		const planDir = planDirFor(slug);
+		let stepCounter = 0;
+
+		pi.registerTool({
+			name: "write_plan",
+			label: "Write Plan",
+			description: "Write the plan overview file. Can only be called once.",
+			parameters: Type.Object({
+				content: Type.String({ description: "Plan overview content (markdown)" }),
+			}),
+			async execute(_id, params) {
+				if (fs.existsSync(path.join(planDir, "plan.md"))) {
+					throw new Error("write_plan already called — plan.md already exists");
+				}
+				fs.mkdirSync(planDir, { recursive: true });
+				fs.writeFileSync(path.join(planDir, "plan.md"), (params as { content: string }).content, { mode: 0o600 });
+				return { content: [{ type: "text", text: `Wrote ${planDir}/plan.md` }] };
+			},
+		});
+
+		pi.registerTool({
+			name: "write_step",
+			label: "Write Step",
+			description: "Write a numbered step file. Auto-numbers starting at 001.",
+			parameters: Type.Object({
+				content: Type.String({ description: "Step content (markdown)" }),
+			}),
+			async execute(_id, params) {
+				if (!fs.existsSync(planDir)) {
+					throw new Error("write_step called before write_plan — plan directory does not exist");
+				}
+				stepCounter++;
+				const padded = String(stepCounter).padStart(3, "0");
+				const filename = `step-${padded}.md`;
+				fs.writeFileSync(path.join(planDir, filename), (params as { content: string }).content, { mode: 0o600 });
+				return { content: [{ type: "text", text: `Wrote ${planDir}/${filename}` }] };
+			},
+		});
+
+		pi.setActiveTools([...agent.tools, "write_plan", "write_step", "report"]);
+	}
+
 	let delivered = false;
 	let aborted = false;
 
@@ -622,6 +698,10 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.registerFlag("subagent-socket", {
 		description: "Parent socket path (internal)",
+		type: "string",
+	});
+	pi.registerFlag("subagent-plan-slug", {
+		description: "Plan slug for plan agent (internal)",
 		type: "string",
 	});
 

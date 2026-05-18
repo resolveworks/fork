@@ -46,9 +46,9 @@ Communication is socket-based: each parent listens on `~/.pi/agent/extensions/fo
 
 Three agents are hardcoded in the `AGENTS` array in `index.ts`:
 
-- **planner** — Read-only planning specialist.
-- **implementer** — Executes plans with code changes.
-- **reviewer** — Read-only code review specialist.
+- **plan** — Read-only planning specialist. Uses dedicated `write_plan` and `write_step` tools to write `plans/<slug>/plan.md` (overview) and `plans/<slug>/step-NNN.md` (one per step).
+- **implement** — Executes a single step. Reads `plans/<slug>/plan.md` for overview context and `plans/<slug>/step-NNN.md` for the specific step. The `plan` param is a slug (e.g. `dark-mode`); paths are constructed internally.
+- **review** — Read-only code review specialist. Reads the same plan/step files and reviews the commit against the step's acceptance criteria.
 
 This keeps the interplay between them tightly controlled and easy to iterate on.
 
@@ -59,7 +59,7 @@ This keeps the interplay between them tightly controlled and easy to iterate on.
 
 ### Lifecycle
 
-1. LLM calls an agent's tool → parent writes the task file, creates a tmux window, and `send-keys` a `pi --agent <name> --subagent-id <id> --subagent-socket <path> --subagent-window <win> @<taskPath>` command into it
+1. LLM calls an agent's tool → parent writes the task file, creates a tmux window, and `send-keys` a `pi --agent <name> --subagent-id <id> --subagent-socket <path> [--subagent-plan-slug <slug>] @<taskPath>` command into it
 2. Child starts in an isolated pi session, applies the agent's system prompt via `before_agent_start`, and reads the task from the task file
 3. On `agent_end`: if clean completion (`stopReason === "stop"` + no pending messages), child sends a success `ResultPayload` over the socket and shuts down. If the human interrupted, child sends `takenOver: true` and stays alive as an interactive pi (with a `report` tool if the run was aborted).
 4. Parent's socket connection handler parses the JSON line and delivers a `fork-result` notification → triggers a new parent turn
@@ -74,6 +74,12 @@ Setup and teardown ride pi's own events: the socket server is created in `sessio
 All runtime state lives under `~/.pi/agent/extensions/fork/`:
 - `sockets/` — per-parent Unix domain sockets (`<parentSessionId>.sock`, mode 0o600)
 - `tasks/` — task message files handed to children at spawn (mode 0o600)
+
+Plan files live in the working directory:
+- `plans/<slug>/plan.md` — plan overview (mode 0o600)
+- `plans/<slug>/step-NNN.md` — individual step files (mode 0o600)
+
+The plan directory defaults to `plans/` but can be overridden with the `FORK_PLANS_DIR` environment variable.
 
 ## Conventions
 

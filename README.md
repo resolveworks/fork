@@ -39,6 +39,6 @@ If an agent definition has no `tools` specified, the subagent inherits pi's full
 
 Three agents are hardcoded in `index.ts`:
 
-- **planner** — Read-only planning specialist.
-- **implementer** — Executes plans with code changes.
-- **reviewer** — Read-only code review specialist.
+- **plan** — Read-only planning specialist. Writes `plans/<slug>/plan.md` (overview) and `plans/<slug>/step-NNN.md` (one per step) via dedicated `write_plan`/`write_step` tools.
+- **implement** — Executes a single step. Reads `plans/<slug>/plan.md` for overview context and `plans/<slug>/step-NNN.md` for the specific step to implement. Commits on the current branch.
+- **review** — Read-only code review specialist. Reads the same plan/step files and reviews the commit against the step's acceptance criteria.
