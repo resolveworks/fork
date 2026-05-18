@@ -196,9 +196,7 @@ class ImplementAgent extends SubAgent<
 			"You are an implementation specialist. Implement exactly one step of a",
 			"plan — not more.",
 			"",
-			"- Read plans/<slug>/plan.md for the overview.",
-			"- Read plans/<slug>/step-NNN.md for your specific step.",
-			"- Implement only that step's changes.",
+			"- Implement only the step described in the task.",
 			"- Commit when done. Pre-commit hooks (type-check, lint, tests) must pass.",
 			"  If a hook fails, fix the underlying issue and re-commit — don't bypass.",
 			"- Output a one-line summary of what changed.",
@@ -208,12 +206,24 @@ class ImplementAgent extends SubAgent<
 	formatTask({ plan, step }: { plan: string; step: number }): string {
 		const padded = String(step).padStart(3, "0");
 		const dir = planDirFor(plan);
+		const planPath = path.join(dir, "plan.md");
+		const stepPath = path.join(dir, `step-${padded}.md`);
+		if (!fs.existsSync(planPath)) {
+			throw new Error(`fork: plan file not found: ${planPath}`);
+		}
+		if (!fs.existsSync(stepPath)) {
+			throw new Error(`fork: step file not found: ${stepPath}`);
+		}
+		const planContent = fs.readFileSync(planPath, "utf-8");
+		const stepContent = fs.readFileSync(stepPath, "utf-8");
 		return [
-			`Implement step ${step} of the plan "${plan}".`,
+			`# Plan Overview`,
 			"",
-			`1. Read ${dir}/plan.md for the overview.`,
-			`2. Read ${dir}/step-${padded}.md for the specific step.`,
-			"3. Implement only that step, then commit.",
+			planContent,
+			"",
+			`# Step ${padded}`,
+			"",
+			stepContent,
 		].join("\n");
 	}
 
@@ -259,8 +269,6 @@ class ReviewAgent extends SubAgent<
 			"implemented correctly. Pre-commit hooks already ran — don't re-run",
 			"linters, type-checks, or tests. Focus on judgment:",
 			"",
-			"- Read plans/<slug>/plan.md for the overview and plans/<slug>/step-NNN.md",
-			"  for the specific step's acceptance criteria.",
 			"- Does the diff match the step's acceptance criterion?",
 			"- Design problems, missed edge cases, security issues, inconsistency.",
 			"",
@@ -287,14 +295,30 @@ class ReviewAgent extends SubAgent<
 	}: { plan: string; step: number; commit: string }): string {
 		const padded = String(step).padStart(3, "0");
 		const dir = planDirFor(plan);
+		const planPath = path.join(dir, "plan.md");
+		const stepPath = path.join(dir, `step-${padded}.md`);
+		if (!fs.existsSync(planPath)) {
+			throw new Error(`fork: plan file not found: ${planPath}`);
+		}
+		if (!fs.existsSync(stepPath)) {
+			throw new Error(`fork: step file not found: ${stepPath}`);
+		}
+		const planContent = fs.readFileSync(planPath, "utf-8");
+		const stepContent = fs.readFileSync(stepPath, "utf-8");
 		return [
-			`Review commit ${commit}, which implements step ${step} of plan "${plan}".`,
+			`Review commit ${commit}, which implements step ${padded} of plan "${plan}".`,
 			"",
-			`1. Read ${dir}/plan.md for the overview.`,
-			`2. Read ${dir}/step-${padded}.md for the step's acceptance criteria.`,
-			`3. Inspect the diff with \`git show ${commit}\`.`,
-			`4. Judge whether the commit meets the step's intent and acceptance.`,
-			`5. Emit the verdict block per the system prompt.`,
+			"# Plan Overview",
+			"",
+			planContent,
+			"",
+			`# Step ${padded}`,
+			"",
+			stepContent,
+			"",
+			`Inspect the diff with \`git show ${commit}\`.`,
+			"Judge whether the commit meets the step's intent and acceptance.",
+			"Emit the verdict block per the system prompt.",
 		].join("\n");
 	}
 
