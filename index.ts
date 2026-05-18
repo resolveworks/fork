@@ -12,16 +12,16 @@
  * `implement` (plan child), `commit` (implement child), `review`
  * (review child).
  *
- * Tasks are served to children over HTTP on the same Unix socket.
- * The parent stores task text keyed by id; children fetch theirs
- * via GET /task/:id during before_agent_start.
+ * Tasks are written to per-id files under tasks/; the child reads its
+ * task via pi's `@<path>` argument syntax. Files are deleted when the
+ * child reports completion.
  *
  * Requires: run pi inside tmux.
  */
 
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as http from "node:http";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -44,8 +44,8 @@ function tmuxSession(): string {
 
 const ROOT = path.join(os.homedir(), ".pi", "agent", "extensions", "fork");
 const SOCKETS_DIR = path.join(ROOT, "sockets");
+const TASKS_DIR = path.join(ROOT, "tasks");
 const RESULT_TYPE = "fork-result";
-const TASK_MESSAGE_TYPE = "fork-task";
 
 function socketPathFor(parentSessionId: string): string {
 	return path.join(SOCKETS_DIR, `${parentSessionId}.sock`);
@@ -99,7 +99,6 @@ interface State {
 	sessionId: string;
 	active: Map<string, ActiveAgent>;
 	pipeline: Pipeline | null;
-	pendingTasks: Map<string, string>;
 }
 
 // ── system prompts ──────────────────────────────────────────────────
@@ -184,7 +183,8 @@ function openSubagentWindow(
 ): { id: string; tmuxWindow: string } {
 	const { kind, task, cwd, extraArgs = [] } = opts;
 	const id = `pi-${kind}-${Date.now().toString(36)}`;
-	state.pendingTasks.set(id, task);
+	const taskPath = path.join(TASKS_DIR, `${id}.md`);
+	fs.writeFileSync(taskPath, task, { mode: 0o600 });
 	const cmdArgs = [
 		"pi",
 		"--agent",
@@ -194,6 +194,7 @@ function openSubagentWindow(
 		"--subagent-socket",
 		socketPathFor(state.sessionId),
 		...extraArgs,
+		`@${taskPath}`,
 	];
 	const win = execSync(
 		`tmux new-window -t ${state.session} -n ${id} -c ${cwd} -P -F '#I' '${cmdArgs.join(" ")}'`,
@@ -350,6 +351,7 @@ function deliverResult(
 		encoding: "utf-8",
 		timeout: 3000,
 	});
+	fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
 
 	switch (slot.kind) {
 		case "plan":
@@ -395,50 +397,33 @@ function deliverResult(
 
 function setupParent(pi: ExtensionAPI): void {
 	fs.mkdirSync(SOCKETS_DIR, { recursive: true });
+	fs.mkdirSync(TASKS_DIR, { recursive: true });
 
 	const state: State = {
 		session: tmuxSession(),
 		sessionId: "",
 		active: new Map(),
 		pipeline: null,
-		pendingTasks: new Map(),
 	};
 
-	let server: http.Server | null = null;
+	let server: net.Server | null = null;
 	let sockPath: string | null = null;
 
 	pi.on("session_start", (_event, ctx) => {
 		state.sessionId = ctx.sessionManager.getSessionId();
 		sockPath = socketPathFor(state.sessionId);
-		server = http.createServer((req, res) => {
-			const taskMatch = req.url?.match(/^\/task\/(.+)$/);
-			if (req.method === "GET" && taskMatch) {
-				const taskId = decodeURIComponent(taskMatch[1]);
-				const task = state.pendingTasks.get(taskId);
-				if (!task) {
-					res.statusCode = 404;
-					return res.end();
+		server = net.createServer((socket) => {
+			let buf = "";
+			socket.setEncoding("utf-8");
+			socket.on("data", (chunk: string) => {
+				buf += chunk;
+				for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
+					const line = buf.slice(0, nl);
+					buf = buf.slice(nl + 1);
+					if (line.length === 0) continue;
+					deliverResult(pi, state, JSON.parse(line) as ResultPayload);
 				}
-				state.pendingTasks.delete(taskId);
-				res.setHeader("content-type", "application/json");
-				return res.end(
-					JSON.stringify({ content: task, customType: TASK_MESSAGE_TYPE }),
-				);
-			}
-			if (req.method === "POST" && req.url === "/result") {
-				let buf = "";
-				req.setEncoding("utf-8");
-				req.on("data", (c) => {
-					buf += c;
-				});
-				req.on("end", () => {
-					deliverResult(pi, state, JSON.parse(buf) as ResultPayload);
-					res.end();
-				});
-				return;
-			}
-			res.statusCode = 404;
-			res.end();
+			});
 		});
 		const currentSockPath = sockPath;
 		server.listen(currentSockPath, () => {
@@ -469,60 +454,18 @@ function setupParent(pi: ExtensionAPI): void {
 	});
 }
 
-// ── child role: shared helpers ─────────────────────────────────────
+// ── child role: shared helper ──────────────────────────────────────
 
 function reportAndShutdown(
 	socketPath: string,
 	payload: ResultPayload,
 	shutdown: () => void,
 ): void {
-	const body = JSON.stringify(payload);
-	const req = http.request(
-		{
-			socketPath,
-			method: "POST",
-			path: "/result",
-			headers: {
-				"content-type": "application/json",
-				"content-length": Buffer.byteLength(body),
-			},
-		},
-		(res) => {
-			res.resume();
-			res.on("end", shutdown);
-		},
-	);
-	req.on("error", (err) => {
+	const socket = net.connect(socketPath);
+	socket.on("error", (err) => {
 		throw err;
 	});
-	req.end(body);
-}
-
-function fetchTask(socketPath: string, taskId: string): Promise<string> {
-	return new Promise((resolve, reject) => {
-		const req = http.request(
-			{
-				socketPath,
-				method: "GET",
-				path: `/task/${encodeURIComponent(taskId)}`,
-			},
-			(res) => {
-				if (res.statusCode !== 200) {
-					return reject(
-						new Error(`fork: task fetch failed with ${res.statusCode}`),
-					);
-				}
-				let buf = "";
-				res.setEncoding("utf-8");
-				res.on("data", (c) => {
-					buf += c;
-				});
-				res.on("end", () => resolve(buf));
-			},
-		);
-		req.on("error", reject);
-		req.end();
-	});
+	socket.end(`${JSON.stringify(payload)}\n`, () => shutdown());
 }
 
 // ── child role: plan ───────────────────────────────────────────────
@@ -538,13 +481,7 @@ function setupPlanChild(
 			"fork: plan agent missing required --subagent-plan-slug flag",
 		);
 
-	pi.on("before_agent_start", async () => {
-		const task = await fetchTask(socketPath, id);
-		return {
-			systemPrompt: PLAN_PROMPT,
-			message: { customType: TASK_MESSAGE_TYPE, content: task, display: true },
-		};
-	});
+	pi.on("before_agent_start", () => ({ systemPrompt: PLAN_PROMPT }));
 
 	const planDir = planDirFor(slug);
 	let stepCounter = 0;
@@ -625,13 +562,7 @@ function setupImplementChild(
 	id: string,
 	socketPath: string,
 ): void {
-	pi.on("before_agent_start", async () => {
-		const task = await fetchTask(socketPath, id);
-		return {
-			systemPrompt: IMPLEMENT_PROMPT,
-			message: { customType: TASK_MESSAGE_TYPE, content: task, display: true },
-		};
-	});
+	pi.on("before_agent_start", () => ({ systemPrompt: IMPLEMENT_PROMPT }));
 
 	pi.registerTool({
 		name: "commit",
@@ -664,13 +595,7 @@ function setupReviewChild(
 	id: string,
 	socketPath: string,
 ): void {
-	pi.on("before_agent_start", async () => {
-		const task = await fetchTask(socketPath, id);
-		return {
-			systemPrompt: REVIEW_PROMPT,
-			message: { customType: TASK_MESSAGE_TYPE, content: task, display: true },
-		};
-	});
+	pi.on("before_agent_start", () => ({ systemPrompt: REVIEW_PROMPT }));
 
 	pi.registerTool({
 		name: "review",

@@ -12,4 +12,6 @@ Fail-fast. No defensive programming, no fallbacks, no silent catches. Missing co
 
 - **tmux.** The extension no-ops outside tmux.
 - **Plans directory** defaults to `./plans/`; override with `FORK_PLANS_DIR`.
-- **Runtime state** lives under `~/.pi/agent/extensions/fork/sockets/` (per-parent Unix sockets, mode `0o600`).
+- **Runtime state** lives under `~/.pi/agent/extensions/fork/`:
+  - `sockets/` — per-parent Unix sockets, mode `0o600`
+  - `tasks/` — per-id task files handed to children at spawn via pi's `@<path>` argument, mode `0o600`
