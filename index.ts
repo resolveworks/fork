@@ -158,10 +158,9 @@ function spawnPlan(
 	params: { goal: string; slug: string },
 	cwd: string,
 ) {
-	const task = `Write a plan for the following goal. Save plan.md and step files under ${planDirFor(params.slug)}/.\n\nGoal: ${params.goal}`;
 	const { id, tmuxWindow } = openSubagentWindow(state, {
 		kind: "plan",
-		task,
+		task: params.goal,
 		cwd,
 		extraArgs: ["--subagent-plan-slug", params.slug],
 	});
@@ -377,7 +376,7 @@ function setupParent(pi: ExtensionAPI): void {
 		name: "plan",
 		label: "Plan",
 		description:
-			"Create an implementation plan. Reads the codebase and writes plans/<slug>/plan.md + step files.",
+			"Create an implementation plan. Spawns a subagent that reads the codebase and writes plans/<slug>/plan.md + step files.",
 		parameters: Type.Object({
 			goal: Type.String({ description: "What the plan should accomplish" }),
 			slug: Type.String({
