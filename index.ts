@@ -32,7 +32,6 @@ function inTmux(): boolean {
 
 const ROOT = path.join(os.homedir(), ".pi", "agent", "extensions", "fork");
 const SOCKETS_DIR = path.join(ROOT, "sockets");
-const TASKS_DIR = path.join(ROOT, "tasks");
 const RESULT_TYPE = "fork-result";
 
 function socketPathFor(parentSessionId: string): string {
@@ -243,19 +242,8 @@ function spawn(
 	cwd: string,
 ): { content: Array<{ type: "text"; text: string }> } {
 	const id = `pi-${agent.name}-${Date.now().toString(36)}`;
-	const taskPath = path.join(TASKS_DIR, `${id}.md`);
-	fs.writeFileSync(taskPath, agent.formatTask(params), { mode: 0o600 });
 
-	const win = execSync(
-		`tmux new-window -t ${session} -n ${id} -c ${cwd} -P -F '#I'`,
-		{ encoding: "utf-8", timeout: 3000 },
-	).trim();
-	execSync(`tmux set-option -t ${session}:${win} -w remain-on-exit off`, {
-		encoding: "utf-8",
-		timeout: 3000,
-	});
-
-	const cmdParts = [
+	const cmdArgs = [
 		"pi",
 		"--agent",
 		agent.name,
@@ -265,13 +253,19 @@ function spawn(
 		socketPathFor(sessionId),
 	];
 	if (agent === planAgent) {
-		cmdParts.push("--subagent-plan-slug", (params as { slug: string }).slug);
+		cmdArgs.push("--subagent-plan-slug", (params as { slug: string }).slug);
 	}
-	cmdParts.push(`@${taskPath}`);
-	execSync(
-		`tmux send-keys -t ${session}:${win} ${JSON.stringify(cmdParts.join(" "))} Enter`,
+
+	const task = agent.formatTask(params).replace(/'/g, "'\\''");
+	const innerCmd = `${cmdArgs.join(" ")} <<'TASK_EOF'\n${task}\nTASK_EOF`;
+	const win = execSync(
+		`tmux new-window -t ${session} -n ${id} -c ${cwd} -P -F '#I' '${innerCmd.replace(/'/g, "'\\''")}'`,
 		{ encoding: "utf-8", timeout: 3000 },
-	);
+	).trim();
+	execSync(`tmux set-option -t ${session}:${win} -w remain-on-exit off`, {
+		encoding: "utf-8",
+		timeout: 3000,
+	});
 
 	active.set(id, { agent, params, tmuxWindow: win, cwd });
 
@@ -343,7 +337,6 @@ function deliverResult(
 		encoding: "utf-8",
 		timeout: 3000,
 	});
-	fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
 
 	const name = slot.agent.name;
 	if (name === "plan") {
@@ -393,7 +386,6 @@ interface State {
 
 function setupParent(pi: ExtensionAPI): void {
 	fs.mkdirSync(SOCKETS_DIR, { recursive: true });
-	fs.mkdirSync(TASKS_DIR, { recursive: true });
 
 	const state: State = {
 		session: tmuxSession(),

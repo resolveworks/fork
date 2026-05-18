@@ -60,8 +60,8 @@ Three agents are defined as plain objects conforming to the `Agent<P>` interface
 
 ### Lifecycle
 
-1. LLM calls the `plan` tool → parent writes the task file, creates a tmux window, and `send-keys` a `pi --agent plan ...` command into it
-2. Child starts in an isolated pi session, applies the plan system prompt via `before_agent_start`, and reads the task from the task file
+1. LLM calls the `plan` tool → parent creates a tmux window with a `pi --agent plan ...` command using a heredoc to pass the task content
+2. Child starts in an isolated pi session, applies the plan system prompt via `before_agent_start`, and reads the task from stdin
 3. Plan agent writes plan.md and step files, then calls `implement` → sends `{ id }` over the socket
 4. `deliverResult` sees a plan agent completed → calls `startPipeline`, which reads the plan directory to count steps and spawns an implement agent for step 1
 5. Implement agent makes changes and calls `commit` (stages + commits) → `deliverResult` sees an implement agent completed → spawns a review agent for that step
@@ -69,7 +69,7 @@ Three agents are defined as plain objects conforming to the `Agent<P>` interface
 7. `deliverResult` sees a review agent completed:
    - If verdict is `"pass"`: advances to next step (spawns implement) or completes the pipeline if all steps done
    - If verdict is `"changes-needed"`: stops the pipeline and notifies the LLM
-8. Clean completions automatically close the subagent's tmux window and remove its task file
+8. Clean completions automatically close the subagent's tmux window
 
 ### Lifecycle hooks
 
@@ -79,7 +79,6 @@ Setup and teardown ride pi's own events: the socket server is created in `sessio
 
 All runtime state lives under `~/.pi/agent/extensions/fork/`:
 - `sockets/` — per-parent Unix domain sockets (`<parentSessionId>.sock`, mode 0o600)
-- `tasks/` — task message files handed to children at spawn (mode 0o600)
 
 Plan files live in the working directory:
 - `plans/<slug>/plan.md` — plan overview (mode 0o600)
@@ -94,7 +93,7 @@ The plan directory defaults to `plans/` but can be overridden with the `FORK_PLA
 - **No build step.** pi loads `.ts` files directly via its runtime.
 - **No tests currently.** If adding tests, note the heavy tmux dependency would need mocking.
 - **Error handling** follows fail-fast: if something is wrong, throw or crash with a clear message. No silent catches, no empty-string fallbacks. If tmux isn't available, say so and fail.
-- **File permissions:** Task files are written with mode `0o600` (user-only read/write).
+- **File permissions:** Socket files use mode `0o600` (user-only read/write).
 
 ## Making Changes
 
