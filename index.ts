@@ -53,12 +53,6 @@ function planDirFor(slug: string): string {
 
 interface ResultPayload {
 	id: string;
-	agent: string;
-	success: boolean;
-	takenOver: boolean;
-	stopReason: string;
-	summary: string;
-	timestamp: number;
 }
 
 
@@ -398,46 +392,28 @@ class Dispatcher {
 		if (!slot) throw new Error(`fork: deliverResult called for unknown agent ${payload.id}`);
 		const { tmuxWindow } = slot;
 
-		const message = this.formatDelivery(payload, slot);
+		const content = this.formatDelivery(slot);
 
 		this.pi.sendMessage(
 			{
 				customType: RESULT_TYPE,
-				content: message.content,
+				content,
 				display: true,
-				details: message.details,
 			},
 			{ triggerTurn: true },
 		);
 
-		if (!payload.takenOver) {
-			this.finalized.add(payload.id);
-			this.active.delete(payload.id);
-			execSync(`tmux kill-window -t ${this.session}:${tmuxWindow}`, { encoding: "utf-8", timeout: 3000 });
-			fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
-		}
+		this.finalized.add(payload.id);
+		this.active.delete(payload.id);
+		execSync(`tmux kill-window -t ${this.session}:${tmuxWindow}`, { encoding: "utf-8", timeout: 3000 });
+		fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
 	}
 
 	private formatDelivery(
-		data: ResultPayload,
 		slot: { agent: SubAgent<any, any>; params: any; tmuxWindow: string },
-	): {
-		content: string;
-		details: unknown;
-	} {
-		if (data.takenOver) {
-			return {
-				content: `Subagent **${data.agent}** (window ${slot.tmuxWindow}) was taken over — no findings returned. (stopReason: ${data.stopReason})`,
-				details: data,
-			};
-		}
-
+	): string {
 		const typed = slot.agent.extractResult(slot.params);
-
-		return {
-			content: `Subagent **${data.agent}** completed:\n\n\`\`\`json\n${JSON.stringify(typed, null, 2)}\n\`\`\``,
-			details: { ...data, typed },
-		};
+		return `Subagent **${slot.agent.name}** completed:\n\n\`\`\`json\n${JSON.stringify(typed, null, 2)}\n\`\`\``;
 	}
 }
 
