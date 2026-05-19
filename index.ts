@@ -138,7 +138,7 @@ function openSubagentWindow(
 		`@${taskPath}`,
 	];
 	const win = execSync(
-		`tmux new-window -t ${state.session} -n ${id} -c ${cwd} -P -F '#I' '${cmdArgs.join(" ")}'`,
+		`tmux new-window -t ${state.session}: -n ${id} -c ${cwd} -P -F '#I' '${cmdArgs.join(" ")}'`,
 		{ encoding: "utf-8", timeout: 3000 },
 	).trim();
 	execSync(`tmux set-option -t ${state.session}:${win} -w remain-on-exit off`, {
