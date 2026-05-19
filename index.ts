@@ -12,8 +12,8 @@
  * returns the summary as the tool result. The LLM orchestrates the
  * loop.
  *
- * Tools are gated via `pi.setActiveTools`: only `plan` is callable
- * until a plan exists; once it does, implement/review unlock.
+ * `implement` and `review` error out until a `plan` call has produced
+ * step files; the LLM is expected to call `plan` first.
  *
  * Calls are serialized — only one subagent runs at a time.
  *
@@ -308,7 +308,6 @@ function setupParent(
       if (state.active.size > 0)
         throw new Error("fork: another agent is in flight");
       state.activePlan = null;
-      pi.setActiveTools(["plan"]);
       const p = params as { goal: string; slug: string };
       const summary = await spawnPlan(state, p, toolCtx.cwd, signal);
       const planDir = planDirFor(p.slug);
@@ -322,7 +321,6 @@ function setupParent(
         );
       }
       state.activePlan = { slug: p.slug, stepCount };
-      pi.setActiveTools(["plan", "implement", "review"]);
       return summaryResult(
         `${summary}\n\nPlan ready: ${stepCount} step${stepCount === 1 ? "" : "s"}. Call implement(1) to begin.`,
       );
@@ -384,8 +382,6 @@ function setupParent(
       return summaryResult(summary);
     },
   });
-
-  pi.setActiveTools(["plan"]);
 }
 
 function observeCompletion(
