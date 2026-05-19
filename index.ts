@@ -374,7 +374,7 @@ function setupParent(
     name: "plan",
     label: "Plan",
     description:
-      "Create an implementation plan. Spawns a subagent that reads the codebase and writes plans/<slug>/plan.md + step files.",
+      "Spawn a subagent to plan and implement a feature automatically.",
     parameters: Type.Object({
       goal: Type.String({ description: "What the plan should accomplish" }),
       slug: Type.String({
@@ -409,7 +409,9 @@ function setupPlanChild(
       "fork: plan agent missing required --subagent-plan-slug flag",
     );
 
-  pi.on("before_agent_start", () => ({ systemPrompt: loadPrompt("plan") }));
+  pi.on("before_agent_start", (event) => ({
+    systemPrompt: event.systemPrompt + "\n\n" + loadPrompt("plan"),
+  }));
 
   const planDir = planDirFor(slug);
   let stepCounter = 0;
@@ -488,8 +490,8 @@ function setupImplementChild(
   id: string,
   socketPath: string,
 ): void {
-  pi.on("before_agent_start", () => ({
-    systemPrompt: loadPrompt("implement"),
+  pi.on("before_agent_start", (event) => ({
+    systemPrompt: event.systemPrompt + "\n\n" + loadPrompt("implement"),
   }));
 
   pi.registerTool({
@@ -529,7 +531,9 @@ function setupReviewChild(
   id: string,
   socketPath: string,
 ): void {
-  pi.on("before_agent_start", () => ({ systemPrompt: loadPrompt("review") }));
+  pi.on("before_agent_start", (event) => ({
+    systemPrompt: event.systemPrompt + "\n\n" + loadPrompt("review"),
+  }));
 
   pi.registerTool({
     name: "review",
