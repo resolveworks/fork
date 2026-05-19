@@ -5,6 +5,10 @@
  * selects mode: present → child running as that named agent; absent →
  * parent that registers the `plan` tool and watches for results.
  *
+ * Role is resolved on `session_start` (pi populates extension flag
+ * values only after all factories run), and each role registers its
+ * own tools and handlers from there.
+ *
  * Children run as separate `pi` processes in new tmux windows. The
  * parent's tool call returns immediately; results arrive over a Unix
  * domain socket and are delivered as `fork-result` notifications that
@@ -45,7 +49,9 @@ function tmuxSession(): string {
 const ROOT = path.join(os.homedir(), ".pi", "agent", "extensions", "fork");
 const SOCKETS_DIR = path.join(ROOT, "sockets");
 const TASKS_DIR = path.join(ROOT, "tasks");
+const PROMPTS_DIR = path.join(__dirname, "prompts");
 const RESULT_TYPE = "fork-result";
+const READ_ONLY = ["read", "grep", "find", "ls"];
 
 function socketPathFor(parentSessionId: string): string {
 	return path.join(SOCKETS_DIR, `${parentSessionId}.sock`);
@@ -53,6 +59,10 @@ function socketPathFor(parentSessionId: string): string {
 
 function planDirFor(slug: string): string {
 	return path.join(process.env.FORK_PLANS_DIR ?? "plans", slug);
+}
+
+function loadPrompt(name: string): string {
+	return fs.readFileSync(path.join(PROMPTS_DIR, `${name}.md`), "utf-8");
 }
 
 // ── result payloads (child → parent over socket) ────────────────────
@@ -100,10 +110,6 @@ interface State {
 	active: Map<string, ActiveAgent>;
 	pipeline: Pipeline | null;
 }
-
-const PROMPTS_DIR = path.join(__dirname, "prompts");
-
-const READ_ONLY = ["read", "grep", "find", "ls"];
 
 // ── parent: spawn primitive + per-kind helpers ─────────────────────
 
@@ -327,49 +333,41 @@ function deliverResult(
 	}
 }
 
-// ── parent role ─────────────────────────────────────────────────────
+// ── role setup (invoked from session_start, when flags are populated) ─
 
-function setupParent(pi: ExtensionAPI): void {
+function setupParent(
+	pi: ExtensionAPI,
+	ctx: { sessionManager: { getSessionId: () => string } },
+): void {
 	fs.mkdirSync(SOCKETS_DIR, { recursive: true });
 	fs.mkdirSync(TASKS_DIR, { recursive: true });
 
 	const state: State = {
 		session: tmuxSession(),
-		sessionId: "",
+		sessionId: ctx.sessionManager.getSessionId(),
 		active: new Map(),
 		pipeline: null,
 	};
+	const sockPath = socketPathFor(state.sessionId);
 
-	let server: net.Server | null = null;
-	let sockPath: string | null = null;
-
-	pi.on("session_start", (_event, ctx) => {
-		state.sessionId = ctx.sessionManager.getSessionId();
-		sockPath = socketPathFor(state.sessionId);
-		server = net.createServer((socket) => {
-			let buf = "";
-			socket.setEncoding("utf-8");
-			socket.on("data", (chunk: string) => {
-				buf += chunk;
-				for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
-					const line = buf.slice(0, nl);
-					buf = buf.slice(nl + 1);
-					if (line.length === 0) continue;
-					deliverResult(pi, state, JSON.parse(line) as ResultPayload);
-				}
-			});
-		});
-		const currentSockPath = sockPath;
-		server.listen(currentSockPath, () => {
-			fs.chmodSync(currentSockPath, 0o600);
+	const server = net.createServer((socket) => {
+		let buf = "";
+		socket.setEncoding("utf-8");
+		socket.on("data", (chunk: string) => {
+			buf += chunk;
+			for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
+				const line = buf.slice(0, nl);
+				buf = buf.slice(nl + 1);
+				if (line.length === 0) continue;
+				deliverResult(pi, state, JSON.parse(line) as ResultPayload);
+			}
 		});
 	});
+	server.listen(sockPath, () => fs.chmodSync(sockPath, 0o600));
 
 	pi.on("session_shutdown", () => {
-		server?.close();
-		if (sockPath) fs.unlinkSync(sockPath);
-		server = null;
-		sockPath = null;
+		server.close();
+		fs.unlinkSync(sockPath);
 	});
 
 	pi.registerTool({
@@ -383,12 +381,10 @@ function setupParent(pi: ExtensionAPI): void {
 				description: "Filename slug; plan is saved to plans/<slug>/",
 			}),
 		}),
-		execute: async (_id, params, _signal, _onUpdate, ctx) =>
-			spawnPlan(state, params as { goal: string; slug: string }, ctx.cwd),
+		execute: async (_id, params, _signal, _onUpdate, toolCtx) =>
+			spawnPlan(state, params as { goal: string; slug: string }, toolCtx.cwd),
 	});
 }
-
-// ── child role: shared helper ──────────────────────────────────────
 
 function reportAndShutdown(
 	socketPath: string,
@@ -402,8 +398,6 @@ function reportAndShutdown(
 	socket.end(`${JSON.stringify(payload)}\n`, () => shutdown());
 }
 
-// ── child role: plan ───────────────────────────────────────────────
-
 function setupPlanChild(
 	pi: ExtensionAPI,
 	id: string,
@@ -415,9 +409,7 @@ function setupPlanChild(
 			"fork: plan agent missing required --subagent-plan-slug flag",
 		);
 
-	pi.on("before_agent_start", () => ({
-		systemPrompt: fs.readFileSync(path.join(PROMPTS_DIR, "plan.md"), "utf-8"),
-	}));
+	pi.on("before_agent_start", () => ({ systemPrompt: loadPrompt("plan") }));
 
 	const planDir = planDirFor(slug);
 	let stepCounter = 0;
@@ -478,8 +470,8 @@ function setupPlanChild(
 		description:
 			"Report completion to the parent and start implementation. Call when the plan is complete.",
 		parameters: Type.Object({}),
-		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			reportAndShutdown(socketPath, { id }, ctx.shutdown);
+		async execute(_id, _params, _signal, _onUpdate, toolCtx) {
+			reportAndShutdown(socketPath, { id }, toolCtx.shutdown);
 			return {
 				content: [
 					{ type: "text", text: "Plan complete. Starting implementation." },
@@ -491,18 +483,13 @@ function setupPlanChild(
 	pi.setActiveTools([...READ_ONLY, "write_plan", "write_step", "implement"]);
 }
 
-// ── child role: implement ──────────────────────────────────────────
-
 function setupImplementChild(
 	pi: ExtensionAPI,
 	id: string,
 	socketPath: string,
 ): void {
 	pi.on("before_agent_start", () => ({
-		systemPrompt: fs.readFileSync(
-			path.join(PROMPTS_DIR, "implement.md"),
-			"utf-8",
-		),
+		systemPrompt: loadPrompt("implement"),
 	}));
 
 	pi.registerTool({
@@ -514,14 +501,14 @@ function setupImplementChild(
 		parameters: Type.Object({
 			message: Type.String({ description: "Commit message" }),
 		}),
-		async execute(_id, params, _signal, _onUpdate, ctx) {
+		async execute(_id, params, _signal, _onUpdate, toolCtx) {
 			const { message } = params as { message: string };
 			execSync("git add -A", { encoding: "utf-8", timeout: 30000 });
 			execSync(`git commit -m ${JSON.stringify(message)}`, {
 				encoding: "utf-8",
 				timeout: 60000,
 			});
-			reportAndShutdown(socketPath, { id }, ctx.shutdown);
+			reportAndShutdown(socketPath, { id }, toolCtx.shutdown);
 			return { content: [{ type: "text", text: "Committed and done." }] };
 		},
 	});
@@ -529,16 +516,12 @@ function setupImplementChild(
 	pi.setActiveTools(["commit"]);
 }
 
-// ── child role: review ─────────────────────────────────────────────
-
 function setupReviewChild(
 	pi: ExtensionAPI,
 	id: string,
 	socketPath: string,
 ): void {
-	pi.on("before_agent_start", () => ({
-		systemPrompt: fs.readFileSync(path.join(PROMPTS_DIR, "review.md"), "utf-8"),
-	}));
+	pi.on("before_agent_start", () => ({ systemPrompt: loadPrompt("review") }));
 
 	pi.registerTool({
 		name: "review",
@@ -560,13 +543,13 @@ function setupReviewChild(
 				{ description: "Issues found (empty if verdict is pass)" },
 			),
 		}),
-		async execute(_id, params, _signal, _onUpdate, ctx) {
+		async execute(_id, params, _signal, _onUpdate, toolCtx) {
 			const { verdict, issues } = params as {
 				verdict: "pass" | "changes-needed";
 				issues: Array<{ file: string; line: number; issue: string }>;
 			};
 			const result: ReviewResultPayload = { id, verdict };
-			reportAndShutdown(socketPath, result, ctx.shutdown);
+			reportAndShutdown(socketPath, result, toolCtx.shutdown);
 			return {
 				content: [
 					{
@@ -603,30 +586,32 @@ export default function (pi: ExtensionAPI) {
 		type: "string",
 	});
 
-	const agentName = pi.getFlag("agent") as string | undefined;
-	if (agentName === undefined) {
-		setupParent(pi);
-		return;
-	}
+	pi.on("session_start", (_event, ctx) => {
+		const agentName = pi.getFlag("agent") as string | undefined;
+		if (agentName === undefined) {
+			setupParent(pi, ctx);
+			return;
+		}
 
-	const id = pi.getFlag("subagent-id") as string | undefined;
-	const socketPath = pi.getFlag("subagent-socket") as string | undefined;
-	if (!id)
-		throw new Error("fork: subagent missing required --subagent-id flag");
-	if (!socketPath)
-		throw new Error("fork: subagent missing required --subagent-socket flag");
+		const id = pi.getFlag("subagent-id") as string | undefined;
+		const socketPath = pi.getFlag("subagent-socket") as string | undefined;
+		if (!id)
+			throw new Error("fork: subagent missing required --subagent-id flag");
+		if (!socketPath)
+			throw new Error("fork: subagent missing required --subagent-socket flag");
 
-	switch (agentName) {
-		case "plan":
-			setupPlanChild(pi, id, socketPath);
-			return;
-		case "implement":
-			setupImplementChild(pi, id, socketPath);
-			return;
-		case "review":
-			setupReviewChild(pi, id, socketPath);
-			return;
-		default:
-			throw new Error(`fork: unknown agent "${agentName}"`);
-	}
+		switch (agentName) {
+			case "plan":
+				setupPlanChild(pi, id, socketPath);
+				return;
+			case "implement":
+				setupImplementChild(pi, id, socketPath);
+				return;
+			case "review":
+				setupReviewChild(pi, id, socketPath);
+				return;
+			default:
+				throw new Error(`fork: unknown agent "${agentName}"`);
+		}
+	});
 }
