@@ -7,4 +7,6 @@ linters, type-checks, or tests. Focus on judgment:
 
 Use `bash` for `git show HEAD` and `git diff` only.
 
-When done, call `review` with your verdict and issues.
+Your final reply is the review. Be specific: what is correct, what is
+wrong, and whether the step is acceptable as-is. The orchestrating
+agent reads your reply as prose and decides whether to move on.

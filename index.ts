@@ -3,18 +3,19 @@
  *
  * The same extension runs in both parent and child. The `--agent` flag
  * selects mode: present → child running as that named agent; absent →
- * parent that registers the `plan` tool and watches for results.
+ * parent that registers plan/implement/review tools and routes
+ * subagent results back as tool results.
  *
- * Role is resolved on `session_start` (pi populates extension flag
- * values only after all factories run), and each role registers its
- * own tools and handlers from there.
+ * The parent exposes three tools to the LLM: `plan(goal, slug)`,
+ * `implement(step)`, `review(step)`. Each tool spawns a child in a new
+ * tmux window, awaits the child's result over a Unix socket, and
+ * returns the summary as the tool result. The LLM orchestrates the
+ * loop.
  *
- * Children run as separate `pi` processes in new tmux windows. The
- * parent's tool call returns immediately; results arrive over a Unix
- * domain socket and are delivered as `fork-result` notifications that
- * trigger a new turn. Each child has its own completion tool:
- * `implement` (plan child), `commit` (implement child), `review`
- * (review child).
+ * Tools are gated via `pi.setActiveTools`: only `plan` is callable
+ * until a plan exists; once it does, implement/review unlock.
+ *
+ * Calls are serialized — only one subagent runs at a time.
  *
  * Tasks are written to per-id files under tasks/; the child reads its
  * task via pi's `@<path>` argument syntax. Files are deleted when the
@@ -50,7 +51,6 @@ const ROOT = path.join(os.homedir(), ".pi", "agent", "extensions", "fork");
 const SOCKETS_DIR = path.join(ROOT, "sockets");
 const TASKS_DIR = path.join(ROOT, "tasks");
 const PROMPTS_DIR = path.join(__dirname, "prompts");
-const RESULT_TYPE = "fork-result";
 const READ_ONLY = ["read", "grep", "find", "ls"];
 
 function socketPathFor(parentSessionId: string): string {
@@ -65,53 +65,35 @@ function loadPrompt(name: string): string {
   return fs.readFileSync(path.join(PROMPTS_DIR, `${name}.md`), "utf-8");
 }
 
-// ── result payloads (child → parent over socket) ────────────────────
+// ── result payload (child → parent over socket) ─────────────────────
 
 interface ResultPayload {
   id: string;
-}
-
-interface ReviewResultPayload extends ResultPayload {
-  verdict: "pass" | "changes-needed";
+  summary: string;
 }
 
 // ── parent state ────────────────────────────────────────────────────
 
-type ActiveAgent =
-  | {
-      kind: "plan";
-      params: { goal: string; slug: string };
-      tmuxWindow: string;
-      cwd: string;
-    }
-  | {
-      kind: "implement";
-      params: { plan: string; step: number };
-      tmuxWindow: string;
-      cwd: string;
-    }
-  | {
-      kind: "review";
-      params: { plan: string; step: number };
-      tmuxWindow: string;
-      cwd: string;
-    };
+interface ActiveAgent {
+  kind: "plan" | "implement" | "review";
+  tmuxWindow: string;
+  resolve: (summary: string) => void;
+  reject: (err: Error) => void;
+}
 
-interface Pipeline {
+interface ActivePlan {
   slug: string;
-  totalSteps: number;
-  currentStep: number;
-  cwd: string;
+  stepCount: number;
 }
 
 interface State {
   session: string;
   sessionId: string;
   active: Map<string, ActiveAgent>;
-  pipeline: Pipeline | null;
+  activePlan: ActivePlan | null;
 }
 
-// ── parent: spawn primitive + per-kind helpers ─────────────────────
+// ── parent: spawn + await child result ─────────────────────────────
 
 function openSubagentWindow(
   state: State,
@@ -148,30 +130,46 @@ function openSubagentWindow(
   return { id, tmuxWindow: win };
 }
 
-function spawned(kind: string, tmuxWindow: string) {
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: `Spawned ${kind} in tmux window ${tmuxWindow}. Result will be delivered when done.`,
-      },
-    ],
-  };
+function awaitChild(
+  state: State,
+  kind: ActiveAgent["kind"],
+  task: string,
+  cwd: string,
+  signal: AbortSignal | undefined,
+  extraArgs?: string[],
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const { id, tmuxWindow } = openSubagentWindow(state, {
+      kind,
+      task,
+      cwd,
+      extraArgs,
+    });
+    state.active.set(id, { kind, tmuxWindow, resolve, reject });
+    signal?.addEventListener("abort", () => {
+      if (!state.active.has(id)) return;
+      state.active.delete(id);
+      execSync(`tmux kill-window -t ${state.session}:${tmuxWindow}`, {
+        encoding: "utf-8",
+        timeout: 3000,
+      });
+      const taskPath = path.join(TASKS_DIR, `${id}.md`);
+      if (fs.existsSync(taskPath)) fs.unlinkSync(taskPath);
+      reject(new Error("aborted"));
+    });
+  });
 }
 
 function spawnPlan(
   state: State,
   params: { goal: string; slug: string },
   cwd: string,
-) {
-  const { id, tmuxWindow } = openSubagentWindow(state, {
-    kind: "plan",
-    task: params.goal,
-    cwd,
-    extraArgs: ["--subagent-plan-slug", params.slug],
-  });
-  state.active.set(id, { kind: "plan", params, tmuxWindow, cwd });
-  return spawned("plan", tmuxWindow);
+  signal: AbortSignal | undefined,
+): Promise<string> {
+  return awaitChild(state, "plan", params.goal, cwd, signal, [
+    "--subagent-plan-slug",
+    params.slug,
+  ]);
 }
 
 function readStepFiles(plan: string, step: number) {
@@ -194,7 +192,8 @@ function spawnImplement(
   state: State,
   params: { plan: string; step: number },
   cwd: string,
-) {
+  signal: AbortSignal | undefined,
+): Promise<string> {
   const { padded, planContent, stepContent } = readStepFiles(
     params.plan,
     params.step,
@@ -208,20 +207,15 @@ function spawnImplement(
     "",
     stepContent,
   ].join("\n");
-  const { id, tmuxWindow } = openSubagentWindow(state, {
-    kind: "implement",
-    task,
-    cwd,
-  });
-  state.active.set(id, { kind: "implement", params, tmuxWindow, cwd });
-  return spawned("implement", tmuxWindow);
+  return awaitChild(state, "implement", task, cwd, signal);
 }
 
 function spawnReview(
   state: State,
   params: { plan: string; step: number },
   cwd: string,
-) {
+  signal: AbortSignal | undefined,
+): Promise<string> {
   const { padded, planContent, stepContent } = readStepFiles(
     params.plan,
     params.step,
@@ -239,101 +233,30 @@ function spawnReview(
     "",
     "Inspect the diff with `git show HEAD`.",
     "Judge whether the commit meets the step's intent and acceptance.",
-    "Call `review` with your verdict and any issues.",
   ].join("\n");
-  const { id, tmuxWindow } = openSubagentWindow(state, {
-    kind: "review",
-    task,
-    cwd,
-  });
-  state.active.set(id, { kind: "review", params, tmuxWindow, cwd });
-  return spawned("review", tmuxWindow);
+  return awaitChild(state, "review", task, cwd, signal);
 }
 
-// ── parent: pipeline + result delivery ─────────────────────────────
+// ── parent: result delivery ────────────────────────────────────────
 
-function notify(pi: ExtensionAPI, message: string): void {
-  pi.sendMessage(
-    { customType: RESULT_TYPE, content: message, display: true },
-    { triggerTurn: true },
-  );
-}
-
-function startPipeline(
-  pi: ExtensionAPI,
-  state: State,
-  slug: string,
-  cwd: string,
-): void {
-  const planDir = planDirFor(slug);
-  const stepCount = fs
-    .readdirSync(planDir)
-    .filter((f) => f.match(/^step-\d{3}\.md$/)).length;
-  if (stepCount === 0) {
-    notify(pi, "Plan completed with no steps. Nothing to implement.");
-    return;
-  }
-  state.pipeline = { slug, totalSteps: stepCount, currentStep: 1, cwd };
-  notify(pi, `Implementing step 1/${stepCount}...`);
-  spawnImplement(state, { plan: slug, step: 1 }, cwd);
-}
-
-function deliverResult(
-  pi: ExtensionAPI,
-  state: State,
-  payload: ResultPayload,
-): void {
+function deliverResult(state: State, payload: ResultPayload): void {
   const slot = state.active.get(payload.id);
-  if (!slot)
-    throw new Error(`fork: deliverResult for unknown agent ${payload.id}`);
+  // Slot may be absent if the child was aborted before its payload landed.
+  if (!slot) return;
   state.active.delete(payload.id);
   execSync(`tmux kill-window -t ${state.session}:${slot.tmuxWindow}`, {
     encoding: "utf-8",
     timeout: 3000,
   });
   fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
-
-  switch (slot.kind) {
-    case "plan":
-      startPipeline(pi, state, slot.params.slug, slot.cwd);
-      return;
-
-    case "implement": {
-      if (!state.pipeline) throw new Error("fork: no active pipeline");
-      notify(pi, `Step ${slot.params.step} implemented. Reviewing...`);
-      spawnReview(state, slot.params, state.pipeline.cwd);
-      return;
-    }
-
-    case "review": {
-      if (!state.pipeline) throw new Error("fork: no active pipeline");
-      const { verdict } = payload as ReviewResultPayload;
-      if (verdict !== "pass") {
-        notify(
-          pi,
-          `Review failed for step ${slot.params.step}. Pipeline stopped.`,
-        );
-        state.pipeline = null;
-        return;
-      }
-      state.pipeline.currentStep++;
-      if (state.pipeline.currentStep > state.pipeline.totalSteps) {
-        notify(
-          pi,
-          `All ${state.pipeline.totalSteps} steps implemented and reviewed.`,
-        );
-        state.pipeline = null;
-        return;
-      }
-      const { slug, currentStep, totalSteps, cwd } = state.pipeline;
-      notify(pi, `Implementing step ${currentStep}/${totalSteps}...`);
-      spawnImplement(state, { plan: slug, step: currentStep }, cwd);
-      return;
-    }
-  }
+  slot.resolve(payload.summary);
 }
 
-// ── role setup (invoked from session_start, when flags are populated) ─
+// ── role setup ──────────────────────────────────────────────────────
+
+function summaryResult(text: string) {
+  return { content: [{ type: "text" as const, text }] };
+}
 
 function setupParent(
   pi: ExtensionAPI,
@@ -346,7 +269,7 @@ function setupParent(
     session: tmuxSession(),
     sessionId: ctx.sessionManager.getSessionId(),
     active: new Map(),
-    pipeline: null,
+    activePlan: null,
   };
   const sockPath = socketPathFor(state.sessionId);
 
@@ -359,7 +282,7 @@ function setupParent(
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
         if (line.length === 0) continue;
-        deliverResult(pi, state, JSON.parse(line) as ResultPayload);
+        deliverResult(state, JSON.parse(line) as ResultPayload);
       }
     });
   });
@@ -374,28 +297,122 @@ function setupParent(
     name: "plan",
     label: "Plan",
     description:
-      "Spawn a subagent to plan and implement a feature automatically.",
+      "Spawn a planning subagent. Writes plans/<slug>/ and returns a summary.",
     parameters: Type.Object({
       goal: Type.String({ description: "What the plan should accomplish" }),
       slug: Type.String({
         description: "Filename slug; plan is saved to plans/<slug>/",
       }),
     }),
-    execute: async (_id, params, _signal, _onUpdate, toolCtx) =>
-      spawnPlan(state, params as { goal: string; slug: string }, toolCtx.cwd),
+    execute: async (_id, params, signal, _onUpdate, toolCtx) => {
+      if (state.active.size > 0)
+        throw new Error("fork: another agent is in flight");
+      state.activePlan = null;
+      pi.setActiveTools(["plan"]);
+      const p = params as { goal: string; slug: string };
+      const summary = await spawnPlan(state, p, toolCtx.cwd, signal);
+      const planDir = planDirFor(p.slug);
+      const stepCount = fs.existsSync(planDir)
+        ? fs.readdirSync(planDir).filter((f) => f.match(/^step-\d{3}\.md$/))
+            .length
+        : 0;
+      if (stepCount === 0) {
+        return summaryResult(
+          `${summary}\n\n(No step files written; nothing to implement.)`,
+        );
+      }
+      state.activePlan = { slug: p.slug, stepCount };
+      pi.setActiveTools(["plan", "implement", "review"]);
+      return summaryResult(
+        `${summary}\n\nPlan ready: ${stepCount} step${stepCount === 1 ? "" : "s"}. Call implement(1) to begin.`,
+      );
+    },
   });
+
+  pi.registerTool({
+    name: "implement",
+    label: "Implement",
+    description:
+      "Implement one step of the active plan and commit. Errors if no active plan.",
+    parameters: Type.Object({
+      step: Type.Integer({ minimum: 1, description: "1-based step number" }),
+    }),
+    execute: async (_id, params, signal, _onUpdate, toolCtx) => {
+      if (state.active.size > 0)
+        throw new Error("fork: another agent is in flight");
+      if (!state.activePlan)
+        throw new Error("fork: no active plan; call plan first");
+      const { step } = params as { step: number };
+      if (step > state.activePlan.stepCount)
+        throw new Error(
+          `fork: step ${step} out of range; plan has ${state.activePlan.stepCount} steps`,
+        );
+      const summary = await spawnImplement(
+        state,
+        { plan: state.activePlan.slug, step },
+        toolCtx.cwd,
+        signal,
+      );
+      return summaryResult(summary);
+    },
+  });
+
+  pi.registerTool({
+    name: "review",
+    label: "Review",
+    description:
+      "Review the latest commit against a step's acceptance. Errors if no active plan.",
+    parameters: Type.Object({
+      step: Type.Integer({ minimum: 1, description: "1-based step number" }),
+    }),
+    execute: async (_id, params, signal, _onUpdate, toolCtx) => {
+      if (state.active.size > 0)
+        throw new Error("fork: another agent is in flight");
+      if (!state.activePlan)
+        throw new Error("fork: no active plan; call plan first");
+      const { step } = params as { step: number };
+      if (step > state.activePlan.stepCount)
+        throw new Error(
+          `fork: step ${step} out of range; plan has ${state.activePlan.stepCount} steps`,
+        );
+      const summary = await spawnReview(
+        state,
+        { plan: state.activePlan.slug, step },
+        toolCtx.cwd,
+        signal,
+      );
+      return summaryResult(summary);
+    },
+  });
+
+  pi.setActiveTools(["plan"]);
 }
 
-function reportAndShutdown(
+function observeCompletion(
+  pi: ExtensionAPI,
+  id: string,
   socketPath: string,
-  payload: ResultPayload,
-  shutdown: () => void,
 ): void {
-  const socket = net.connect(socketPath);
-  socket.on("error", (err) => {
-    throw err;
+  pi.on("agent_end", (event, ctx) => {
+    const last = [...event.messages]
+      .reverse()
+      .find((m) => m.role === "assistant") as
+      | { role: "assistant"; content: any[]; stopReason?: string }
+      | undefined;
+
+    if (!last || last.stopReason !== "stop" || ctx.hasPendingMessages()) return;
+
+    const summary = (last.content ?? [])
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join("\n");
+
+    const socket = net.connect(socketPath);
+    socket.on("error", (err) => {
+      throw err;
+    });
+    socket.end(`${JSON.stringify({ id, summary })}\n`, () => ctx.shutdown());
   });
-  socket.end(`${JSON.stringify(payload)}\n`, () => shutdown());
 }
 
 function setupPlanChild(
@@ -410,8 +427,10 @@ function setupPlanChild(
     );
 
   pi.on("before_agent_start", (event) => ({
-    systemPrompt: event.systemPrompt + "\n\n" + loadPrompt("plan"),
+    systemPrompt: `${event.systemPrompt}\n\n${loadPrompt("plan")}`,
   }));
+
+  observeCompletion(pi, id, socketPath);
 
   const planDir = planDirFor(slug);
   let stepCounter = 0;
@@ -466,23 +485,7 @@ function setupPlanChild(
     },
   });
 
-  pi.registerTool({
-    name: "implement",
-    label: "Implement",
-    description:
-      "Report completion to the parent and start implementation. Call when the plan is complete.",
-    parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, toolCtx) {
-      reportAndShutdown(socketPath, { id }, toolCtx.shutdown);
-      return {
-        content: [
-          { type: "text", text: "Plan complete. Starting implementation." },
-        ],
-      };
-    },
-  });
-
-  pi.setActiveTools([...READ_ONLY, "write_plan", "write_step", "implement"]);
+  pi.setActiveTools([...READ_ONLY, "write_plan", "write_step"]);
 }
 
 function setupImplementChild(
@@ -491,39 +494,10 @@ function setupImplementChild(
   socketPath: string,
 ): void {
   pi.on("before_agent_start", (event) => ({
-    systemPrompt: event.systemPrompt + "\n\n" + loadPrompt("implement"),
+    systemPrompt: `${event.systemPrompt}\n\n${loadPrompt("implement")}`,
   }));
 
-  pi.registerTool({
-    name: "commit",
-    label: "Commit",
-    description:
-      "Stage all changes, commit, and report completion to the parent. " +
-      "Call when your implementation is complete.",
-    parameters: Type.Object({
-      message: Type.String({ description: "Commit message" }),
-    }),
-    async execute(_id, params) {
-      const { message } = params as { message: string };
-      try {
-        execSync("git add -A", { encoding: "utf-8", timeout: 30000 });
-        execSync(`git commit -m ${JSON.stringify(message)}`, {
-          encoding: "utf-8",
-          timeout: 60000,
-        });
-      } catch (err: any) {
-        const output = err.stderr ?? err.stdout ?? err.message ?? String(err);
-        return {
-          content: [{ type: "text", text: `Commit failed:\n${output}` }],
-          sIsError: true,
-        };
-      }
-      reportAndShutdown(socketPath, { id }, () => {});
-      return { content: [{ type: "text", text: "Committed and done." }] };
-    },
-  });
-
-  pi.setActiveTools(["commit"]);
+  observeCompletion(pi, id, socketPath);
 }
 
 function setupReviewChild(
@@ -532,48 +506,12 @@ function setupReviewChild(
   socketPath: string,
 ): void {
   pi.on("before_agent_start", (event) => ({
-    systemPrompt: event.systemPrompt + "\n\n" + loadPrompt("review"),
+    systemPrompt: `${event.systemPrompt}\n\n${loadPrompt("review")}`,
   }));
 
-  pi.registerTool({
-    name: "review",
-    label: "Review",
-    description:
-      "Submit your review verdict and issues, and report completion to the parent. " +
-      "Call when your review is complete.",
-    parameters: Type.Object({
-      verdict: Type.Union(
-        [Type.Literal("pass"), Type.Literal("changes-needed")],
-        { description: "Whether the step passes review" },
-      ),
-      issues: Type.Array(
-        Type.Object({
-          file: Type.String({ description: "File path" }),
-          line: Type.Number({ description: "Line number" }),
-          issue: Type.String({ description: "Short description" }),
-        }),
-        { description: "Issues found (empty if verdict is pass)" },
-      ),
-    }),
-    async execute(_id, params, _signal, _onUpdate, toolCtx) {
-      const { verdict, issues } = params as {
-        verdict: "pass" | "changes-needed";
-        issues: Array<{ file: string; line: number; issue: string }>;
-      };
-      const result: ReviewResultPayload = { id, verdict };
-      reportAndShutdown(socketPath, result, toolCtx.shutdown);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Review submitted: ${verdict} (${issues.length} issue${issues.length === 1 ? "" : "s"})`,
-          },
-        ],
-      };
-    },
-  });
+  observeCompletion(pi, id, socketPath);
 
-  pi.setActiveTools([...READ_ONLY, "bash", "review"]);
+  pi.setActiveTools([...READ_ONLY, "bash"]);
 }
 
 // ── extension entry ────────────────────────────────────────────────
