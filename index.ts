@@ -2,9 +2,10 @@
  * fork — Spawn pi subagents in separate tmux windows.
  *
  * The parent registers a single `spawn` tool. Calling it opens a new
- * tmux window running pi with the given task. When the child finishes,
- * its final assistant message is sent back over a Unix socket and
- * returned as the tool result.
+ * tmux window running pi with the given task and returns immediately.
+ * When the child finishes, its final assistant message is sent back
+ * over a Unix socket and delivered as a notification that triggers a
+ * new turn.
  *
  * Requires: run pi inside tmux.
  */
@@ -35,6 +36,7 @@ function tmuxSession(): string {
 const ROOT = path.join(os.homedir(), ".pi", "agent", "extensions", "fork");
 const SOCKETS_DIR = path.join(ROOT, "sockets");
 const TASKS_DIR = path.join(ROOT, "tasks");
+const RESULT_TYPE = "fork-result";
 
 function socketPathFor(sessionId: string): string {
   return path.join(SOCKETS_DIR, `${sessionId}.sock`);
@@ -51,8 +53,6 @@ interface ResultPayload {
 
 interface ActiveChild {
   tmuxWindow: string;
-  resolve: (summary: string) => void;
-  reject: (err: Error) => void;
 }
 
 interface State {
@@ -61,56 +61,47 @@ interface State {
   active: Map<string, ActiveChild>;
 }
 
-// ── spawn + await child ─────────────────────────────────────────────
+// ── spawn (fire-and-forget) ─────────────────────────────────────────
 
 function spawn(
   state: State,
   task: string,
   cwd: string,
-  signal: AbortSignal | undefined,
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const id = `pi-${Date.now().toString(36)}`;
-    const taskPath = path.join(TASKS_DIR, `${id}.md`);
-    fs.writeFileSync(taskPath, task, { mode: 0o600 });
+): { id: string; tmuxWindow: string } {
+  const id = `pi-${Date.now().toString(36)}`;
+  const taskPath = path.join(TASKS_DIR, `${id}.md`);
+  fs.writeFileSync(taskPath, task, { mode: 0o600 });
 
-    const cmdArgs = [
-      "pi",
-      "--subagent-id",
-      id,
-      "--subagent-socket",
-      socketPathFor(state.sessionId),
-      `@${taskPath}`,
-    ];
+  const cmdArgs = [
+    "pi",
+    "--subagent-id",
+    id,
+    "--subagent-socket",
+    socketPathFor(state.sessionId),
+    `@${taskPath}`,
+  ];
 
-    const win = execSync(
-      `tmux new-window -t ${state.session}: -n ${id} -c ${cwd} -P -F '#I' '${cmdArgs.join(" ")}'`,
-      { encoding: "utf-8", timeout: 3000 },
-    ).trim();
+  const win = execSync(
+    `tmux new-window -t ${state.session}: -n ${id} -c ${cwd} -P -F '#I' '${cmdArgs.join(" ")}'`,
+    { encoding: "utf-8", timeout: 3000 },
+  ).trim();
 
-    execSync(
-      `tmux set-option -t ${state.session}:${win} -w remain-on-exit off`,
-      { encoding: "utf-8", timeout: 3000 },
-    );
-
-    state.active.set(id, { tmuxWindow: win, resolve, reject });
-
-    signal?.addEventListener("abort", () => {
-      if (!state.active.has(id)) return;
-      state.active.delete(id);
-      execSync(`tmux kill-window -t ${state.session}:${win}`, {
-        encoding: "utf-8",
-        timeout: 3000,
-      });
-      if (fs.existsSync(taskPath)) fs.unlinkSync(taskPath);
-      reject(new Error("aborted"));
-    });
+  execSync(`tmux set-option -t ${state.session}:${win} -w remain-on-exit off`, {
+    encoding: "utf-8",
+    timeout: 3000,
   });
+
+  state.active.set(id, { tmuxWindow: win });
+  return { id, tmuxWindow: win };
 }
 
 // ── result delivery ─────────────────────────────────────────────────
 
-function deliverResult(state: State, payload: ResultPayload): void {
+function deliverResult(
+  pi: ExtensionAPI,
+  state: State,
+  payload: ResultPayload,
+): void {
   const slot = state.active.get(payload.id);
   if (!slot) return; // aborted before result landed
   state.active.delete(payload.id);
@@ -119,14 +110,18 @@ function deliverResult(state: State, payload: ResultPayload): void {
     timeout: 3000,
   });
   fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
-  slot.resolve(payload.summary);
+
+  pi.sendMessage(
+    {
+      customType: RESULT_TYPE,
+      content: payload.summary || "(no output)",
+      display: true,
+    },
+    { triggerTurn: true },
+  );
 }
 
 // ── parent setup ────────────────────────────────────────────────────
-
-function summaryResult(text: string) {
-  return { content: [{ type: "text" as const, text }] };
-}
 
 function setupParent(
   pi: ExtensionAPI,
@@ -151,7 +146,7 @@ function setupParent(
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
         if (line.length === 0) continue;
-        deliverResult(state, JSON.parse(line) as ResultPayload);
+        deliverResult(pi, state, JSON.parse(line) as ResultPayload);
       }
     });
   });
@@ -166,14 +161,23 @@ function setupParent(
     name: "spawn",
     label: "Spawn",
     description:
-      "Spawn a pi subagent in a new tmux window. Returns the subagent's final output.",
+      "Spawn a pi subagent in a new tmux window. Returns immediately. " +
+      "The subagent's final output is delivered as a notification when it finishes, " +
+      "triggering a new turn with the results.",
     parameters: Type.Object({
       task: Type.String({ description: "Task description for the subagent" }),
     }),
-    execute: async (_id, params, signal, _onUpdate, toolCtx) => {
+    execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
       const { task } = params as { task: string };
-      const summary = await spawn(state, task, toolCtx.cwd, signal);
-      return summaryResult(summary);
+      const { tmuxWindow } = spawn(state, task, toolCtx.cwd);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Spawned subagent in tmux window ${tmuxWindow}. Results will be delivered when done.`,
+          },
+        ],
+      };
     },
   });
 }
