@@ -150,7 +150,7 @@ function setupParent(
         content: [
           {
             type: "text" as const,
-            text: `Spawned subagent. Results will be delivered when done.`,
+            text: task,
           },
         ],
       };
