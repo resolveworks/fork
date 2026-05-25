@@ -45,71 +45,39 @@ function socketPathFor(sessionId: string): string {
 // ── result payload (child → parent over socket) ─────────────────────
 
 interface ResultPayload {
-  id: string;
   summary: string;
-}
-
-// ── parent state ────────────────────────────────────────────────────
-
-interface ActiveChild {
-  tmuxWindow: string;
-}
-
-interface State {
-  session: string;
-  sessionId: string;
-  active: Map<string, ActiveChild>;
 }
 
 // ── spawn (fire-and-forget) ─────────────────────────────────────────
 
 function spawn(
-  state: State,
-  task: string,
+  session: string,
+  sessionId: string,
+  taskPath: string,
   cwd: string,
-): { id: string; tmuxWindow: string } {
-  const id = `pi-${Date.now().toString(36)}`;
-  const taskPath = path.join(TASKS_DIR, `${id}.md`);
-  fs.writeFileSync(taskPath, task, { mode: 0o600 });
-
+): void {
+  const id = path.basename(taskPath, ".md");
   const cmdArgs = [
     "pi",
-    "--subagent-id",
-    id,
     "--subagent-socket",
-    socketPathFor(state.sessionId),
+    socketPathFor(sessionId),
     `@${taskPath}`,
   ];
 
-  const win = execSync(
-    `tmux new-window -t ${state.session}: -n ${id} -c ${cwd} -P -F '#I' '${cmdArgs.join(" ")}'`,
+  execSync(
+    `tmux new-window -t ${session}: -n ${id} -c ${cwd} '${cmdArgs.join(" ")}'`,
     { encoding: "utf-8", timeout: 3000 },
-  ).trim();
-
-  execSync(`tmux set-option -t ${state.session}:${win} -w remain-on-exit off`, {
-    encoding: "utf-8",
-    timeout: 3000,
-  });
-
-  state.active.set(id, { tmuxWindow: win });
-  return { id, tmuxWindow: win };
+  );
 }
 
 // ── result delivery ─────────────────────────────────────────────────
 
 function deliverResult(
   pi: ExtensionAPI,
-  state: State,
   payload: ResultPayload,
+  taskPath: string,
 ): void {
-  const slot = state.active.get(payload.id);
-  if (!slot) return; // aborted before result landed
-  state.active.delete(payload.id);
-  execSync(`tmux kill-window -t ${state.session}:${slot.tmuxWindow}`, {
-    encoding: "utf-8",
-    timeout: 3000,
-  });
-  fs.unlinkSync(path.join(TASKS_DIR, `${payload.id}.md`));
+  if (taskPath) fs.unlinkSync(taskPath);
 
   pi.sendMessage(
     {
@@ -130,12 +98,15 @@ function setupParent(
   fs.mkdirSync(SOCKETS_DIR, { recursive: true });
   fs.mkdirSync(TASKS_DIR, { recursive: true });
 
-  const state: State = {
-    session: tmuxSession(),
-    sessionId: ctx.sessionManager.getSessionId(),
-    active: new Map(),
-  };
-  const sockPath = socketPathFor(state.sessionId);
+  const session = tmuxSession();
+  const sessionId = ctx.sessionManager.getSessionId();
+  const sockPath = socketPathFor(sessionId);
+
+  // Remove stale socket from a previous (crashed/killed) run.
+  if (fs.existsSync(sockPath)) fs.unlinkSync(sockPath);
+
+  // Track task files so we can clean them up when results arrive.
+  const taskFiles: string[] = [];
 
   const server = net.createServer((socket) => {
     let buf = "";
@@ -146,7 +117,8 @@ function setupParent(
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
         if (line.length === 0) continue;
-        deliverResult(pi, state, JSON.parse(line) as ResultPayload);
+        const taskPath = taskFiles.shift() ?? "";
+        deliverResult(pi, JSON.parse(line) as ResultPayload, taskPath);
       }
     });
   });
@@ -169,12 +141,16 @@ function setupParent(
     }),
     execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
       const { task } = params as { task: string };
-      const { tmuxWindow } = spawn(state, task, toolCtx.cwd);
+      const id = `pi-${Date.now().toString(36)}`;
+      const taskPath = path.join(TASKS_DIR, `${id}.md`);
+      fs.writeFileSync(taskPath, task, { mode: 0o600 });
+      taskFiles.push(taskPath);
+      spawn(session, sessionId, taskPath, toolCtx.cwd);
       return {
         content: [
           {
             type: "text" as const,
-            text: `Spawned subagent in tmux window ${tmuxWindow}. Results will be delivered when done.`,
+            text: `Spawned subagent. Results will be delivered when done.`,
           },
         ],
       };
@@ -184,7 +160,7 @@ function setupParent(
 
 // ── child setup ─────────────────────────────────────────────────────
 
-function setupChild(pi: ExtensionAPI, id: string, socketPath: string): void {
+function setupChild(pi: ExtensionAPI, socketPath: string): void {
   pi.on("agent_end", (event, ctx) => {
     const last = [...event.messages]
       .reverse()
@@ -203,7 +179,7 @@ function setupChild(pi: ExtensionAPI, id: string, socketPath: string): void {
     socket.on("error", (err) => {
       throw err;
     });
-    socket.end(`${JSON.stringify({ id, summary })}\n`, () => ctx.shutdown());
+    socket.end(`${JSON.stringify({ summary })}\n`, () => ctx.shutdown());
   });
 }
 
@@ -212,28 +188,21 @@ function setupChild(pi: ExtensionAPI, id: string, socketPath: string): void {
 export default function (pi: ExtensionAPI) {
   if (!inTmux()) return;
 
-  pi.registerFlag("subagent-id", {
-    description: "Subagent id (internal)",
-    type: "string",
-  });
   pi.registerFlag("subagent-socket", {
     description: "Parent socket path (internal)",
     type: "string",
   });
 
   pi.on("session_start", (_event, ctx) => {
-    const id = pi.getFlag("subagent-id") as string | undefined;
+    const socketPath = pi.getFlag("subagent-socket") as string | undefined;
 
-    if (id === undefined) {
+    if (socketPath === undefined) {
       // Parent mode
       setupParent(pi, ctx);
       return;
     }
 
     // Child mode
-    const socketPath = pi.getFlag("subagent-socket") as string | undefined;
-    if (!socketPath)
-      throw new Error("fork: subagent missing required --subagent-socket flag");
-    setupChild(pi, id, socketPath);
+    setupChild(pi, socketPath);
   });
 }
