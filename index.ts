@@ -160,7 +160,20 @@ function setupParent(
 
 // ── child setup ─────────────────────────────────────────────────────
 
+const SUBAGENT_SYSTEM_PROMPT =
+  "You are a subagent spawned by a parent pi process. " +
+  "Focus exclusively on the assigned task. " +
+  "When you are done, end your response with a clear summary — " +
+  "your final message is sent back to the parent. " +
+  "Do not attempt to spawn subagents or delegate work.";
+
 function setupChild(pi: ExtensionAPI, socketPath: string): void {
+  pi.on("before_agent_start", (event) => {
+    return {
+      systemPrompt: event.systemPrompt + "\n\n" + SUBAGENT_SYSTEM_PROMPT,
+    };
+  });
+
   pi.on("agent_end", (event, ctx) => {
     const last = [...event.messages]
       .reverse()
