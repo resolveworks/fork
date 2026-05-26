@@ -137,7 +137,11 @@ function setupParent(
       "The subagent's final output is delivered as a notification when it finishes, " +
       "triggering a new turn with the results.",
     parameters: Type.Object({
-      task: Type.String({ description: "Task description for the subagent" }),
+      task: Type.String({
+        description:
+          "Complete task instructions for the subagent. " +
+          "The content is written to a task file and passed directly to the subagent as its input.",
+      }),
     }),
     execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
       const { task } = params as { task: string };
