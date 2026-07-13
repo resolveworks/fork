@@ -345,8 +345,10 @@ function setupParent(
       "current working directory and shares the same filesystem — it is not an " +
       "isolated copy, so its edits are live. Concurrent subagents may finish in " +
       "any order; do not assign overlapping file edits to concurrent subagents, " +
-      "as they can conflict. When it finishes, only the subagent's final textual " +
-      "response is delivered asynchronously into your context.",
+      "as they can conflict. Do not wait, sleep, poll, or check on a spawned " +
+      "subagent. Continue with independent work or end your response; when the " +
+      "subagent finishes, its final text is delivered automatically as a new " +
+      "message that triggers a new turn.",
     parameters: Type.Object({
       task: Type.String({
         description:
@@ -376,7 +378,11 @@ function setupParent(
         content: [
           {
             type: "text" as const,
-            text: `Spawned subagent ${id} in ${toolCtx.cwd}. Its result will arrive asynchronously when the subagent finishes.`,
+            text:
+              `Spawned subagent ${id} in ${toolCtx.cwd}. ` +
+              "Do not wait, sleep, poll, or check its status. Continue with " +
+              "independent work or end your response; its result will arrive " +
+              "automatically in a new turn.",
           },
         ],
       };
