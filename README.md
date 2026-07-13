@@ -25,4 +25,4 @@ The LLM gets one tool: **spawn**. Calling it opens a new tmux window running pi 
 
 Use tmux keybindings (`Ctrl+B n/p/1-9`, etc.) to navigate between windows.
 
-If you take over a subagent's tmux window (by typing or pressing Esc), it stays alive as a regular interactive pi session — it won't send results back.
+Steering or follow-up input typed into a subagent's window becomes part of its delegated run and may shape the result that is eventually returned. Pressing Esc aborts the current delegated run, so that run is not reported back automatically; the subagent stays available as a regular interactive pi session.

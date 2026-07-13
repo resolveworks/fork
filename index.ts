@@ -437,21 +437,62 @@ async function setupChild(
     };
   });
 
-  pi.on("agent_end", (event, ctx) => {
+  // ── result capture and delivery (child → parent) ───────────────────
+  //
+  // agent_end is a low-level run boundary: pi may still auto-retry,
+  // auto-compact and retry, or continue with queued steering/follow-up
+  // afterward. So we only CAPTURE the latest successful assistant result
+  // there and initiate delivery from agent_settled, which fires once pi has
+  // no automatic continuation left.
+  //
+  // `pendingSummary` holds the text of the most recent assistant message with
+  // stopReason "stop"; any other terminus (abort/error/length, or no assistant
+  // message at all) clears it, so an interrupted or failed run is never
+  // reported and cannot leave a stale earlier result to be sent.
+  //
+  // `deliveryStarted` is session-scoped: it guarantees at most one socket send
+  // attempt for the whole child session, even if several runs settle before
+  // the (asynchronous) socket flush and shutdown complete. The per-attempt
+  // `settled` flag below additionally keeps the error, timeout, and flush
+  // callbacks from each finishing the same attempt.
+  let pendingSummary: string | null = null;
+  let deliveryStarted = false;
+
+  pi.on("agent_end", (event) => {
     const last = [...event.messages]
       .reverse()
       .find((m) => m.role === "assistant") as
-      | { role: "assistant"; content: any[]; stopReason?: string }
+      | {
+          role: "assistant";
+          stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
+          content: { type: string; text?: string }[];
+        }
       | undefined;
 
-    if (!last || last.stopReason !== "stop" || ctx.hasPendingMessages()) return;
-
-    const summary = (last.content ?? [])
-      .filter((c: any) => c.type === "text")
-      .map((c: any) => c.text)
+    if (!last || last.stopReason !== "stop") {
+      pendingSummary = null;
+      return;
+    }
+    pendingSummary = last.content
+      .filter((c): c is { type: "text"; text: string } => c.type === "text")
+      .map((c) => c.text)
       .join("\n");
+  });
 
-    const payload = `${JSON.stringify({ id: subagentId, summary })}\n`;
+  pi.on("agent_settled", (_event, ctx) => {
+    // agent_settled fires only after retries, compaction, and queued
+    // continuations have drained; hasPendingMessages is a defensive guard.
+    // deliveryStarted guarantees we attempt at most one send per session.
+    if (
+      deliveryStarted ||
+      pendingSummary === null ||
+      ctx.hasPendingMessages()
+    ) {
+      return;
+    }
+    deliveryStarted = true;
+
+    const payload = `${JSON.stringify({ id: subagentId, summary: pendingSummary })}\n`;
 
     // Deliver over the parent socket without ever throwing from a callback.
     // Only a successful flush counts as delivery; if the result cannot reach
