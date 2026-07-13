@@ -90,6 +90,25 @@ function loadConfig(cwd: string, projectTrusted: boolean): ForkConfig {
   return { ...globalCfg, ...projectCfg };
 }
 
+/**
+ * Seed the global fork.json with the current model so the plugin is useful
+ * out of the box. Only writes if the file does not yet exist; never overwrites
+ * a user's config.
+ */
+function seedConfig(model: { provider: string; id: string }): void {
+  const file = path.join(getAgentDir(), "fork.json");
+  if (fs.existsSync(file)) return;
+  const seeded: ForkConfig = { provider: model.provider, model: model.id };
+  try {
+    fs.writeFileSync(file, `${JSON.stringify(seeded, null, 2)}\n`);
+    console.error(
+      `fork: created ${file} with ${seeded.provider}/${seeded.model}`,
+    );
+  } catch (err) {
+    console.error(`fork: failed to create ${file}: ${err}`);
+  }
+}
+
 // ── spawn (fire-and-forget) ─────────────────────────────────────────
 
 function spawn(
@@ -135,10 +154,17 @@ function deliverResult(
 
 function setupParent(
   pi: ExtensionAPI,
-  ctx: { sessionManager: { getSessionId: () => string } },
+  ctx: {
+    sessionManager: { getSessionId: () => string };
+    model: { provider: string; id: string } | undefined;
+  },
 ): void {
   fs.mkdirSync(SOCKETS_DIR, { recursive: true });
   fs.mkdirSync(TASKS_DIR, { recursive: true });
+
+  // First run: seed ~/.pi/agent/fork.json with the current model so the
+  // plugin works out of the box. Never overwrites an existing file.
+  if (ctx.model) seedConfig(ctx.model);
 
   const session = tmuxSession();
   const sessionId = ctx.sessionManager.getSessionId();
