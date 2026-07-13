@@ -16,8 +16,8 @@
  * Requires: run pi inside tmux.
  */
 
-import { execSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -37,11 +37,31 @@ function inTmux(): boolean {
   return !!process.env.TMUX;
 }
 
+/**
+ * Run a tmux command synchronously with argv passed directly (no shell), so
+ * session names, paths, and arguments containing spaces or metacharacters
+ * are never shell-interpreted. Throws on failure and preserves a timeout.
+ */
+function tmuxSync(args: string[], timeout = 3000): string {
+  const result = spawnSync("tmux", args, { encoding: "utf-8", timeout });
+  if (result.error) throw result.error;
+  if (result.status !== 0 || result.signal) {
+    const detail = [result.stderr.trim(), result.stdout.trim()]
+      .filter(Boolean)
+      .join(" / ");
+    const where =
+      result.signal !== null
+        ? `signal ${result.signal}`
+        : `exit ${result.status ?? "?"}`;
+    throw new Error(
+      `fork: tmux ${args[0]} failed (${where})${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  return result.stdout;
+}
+
 function tmuxSession(): string {
-  return execSync("tmux display-message -p '#S'", {
-    encoding: "utf-8",
-    timeout: 3000,
-  }).trim();
+  return tmuxSync(["display-message", "-p", "#S"]).trim();
 }
 
 // ── paths ───────────────────────────────────────────────────────────
@@ -116,13 +136,22 @@ function seedConfig(model: { provider: string; id: string }): void {
 // ── spawn (fire-and-forget) ─────────────────────────────────────────
 
 /**
- * Generate a unique subagent ID. Combines a millisecond timestamp with
- * random entropy so two rapid spawns can never collide. The ID is used as
- * the task filename, the tmux window name, and the routing key carried in
- * the child's result payload.
+ * Generate a fresh subagent ID. UUID v4 provides ~122 bits of entropy, so
+ * collisions are astronomically unlikely — but not impossible — so we
+ * confirm the ID is neither tracked nor an existing task file before use
+ * and regenerate otherwise. The ID is the task filename, the tmux window
+ * name, and the routing key carried in the child's result payload.
  */
-function newSubagentId(): string {
-  return `pi-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
+function newSubagentId(taskFiles: Map<string, string>): string {
+  for (;;) {
+    const id = randomUUID();
+    if (
+      !taskFiles.has(id) &&
+      !fs.existsSync(path.join(TASKS_DIR, `${id}.md`))
+    ) {
+      return id;
+    }
+  }
 }
 
 function spawn(
@@ -132,6 +161,9 @@ function spawn(
   taskPath: string,
   cwd: string,
 ): void {
+  // Pass the child command and each argument as distinct argv entries.
+  // tmux runs a multi-argument shell-command directly (without `sh -c`), so
+  // paths/IDs with spaces or metacharacters need no shell quoting.
   const cmdArgs = [
     "pi",
     "--subagent-socket",
@@ -141,10 +173,16 @@ function spawn(
     `@${taskPath}`,
   ];
 
-  execSync(
-    `tmux new-window -t ${session}: -n ${id} -c ${cwd} '${cmdArgs.join(" ")}'`,
-    { encoding: "utf-8", timeout: 3000 },
-  );
+  tmuxSync([
+    "new-window",
+    "-t",
+    `${session}:`,
+    "-n",
+    id,
+    "-c",
+    cwd,
+    ...cmdArgs,
+  ]);
 }
 
 // ── result delivery ─────────────────────────────────────────────────
@@ -159,6 +197,70 @@ function deliverResult(pi: ExtensionAPI, payload: ResultPayload): void {
     },
     { triggerTurn: true },
   );
+}
+
+/**
+ * Remove a file, tolerating an already-missing path. Unexpected filesystem
+ * failures are logged but never thrown — callers (result delivery, socket
+ * teardown) must keep working.
+ */
+function safeUnlink(filePath: string, what: string): void {
+  try {
+    fs.unlinkSync(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    console.error(`fork: could not remove ${what} ${filePath}: ${err}`);
+  }
+}
+
+/**
+ * Parse and act on a single newline-delimited result line. Each line is
+ * independent: malformed JSON or payload shape is logged and ignored
+ * without aborting the data handler or dropping later lines. Only a
+ * currently-tracked id is delivered — exactly once — and only its own task
+ * file is removed; unknown or duplicate ids are logged and ignored.
+ */
+function processResultLine(
+  pi: ExtensionAPI,
+  taskFiles: Map<string, string>,
+  line: string,
+): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch (err) {
+    console.error(
+      `fork: ignoring malformed result line (invalid JSON): ${err}`,
+    );
+    return;
+  }
+
+  const candidate = parsed as Partial<ResultPayload>;
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    typeof candidate.id !== "string" ||
+    candidate.id.length === 0 ||
+    typeof candidate.summary !== "string"
+  ) {
+    console.error(`fork: ignoring malformed result payload: ${line}`);
+    return;
+  }
+
+  const id = candidate.id;
+  const taskPath = taskFiles.get(id);
+  if (taskPath === undefined) {
+    console.error(
+      `fork: ignoring result for unknown or already-delivered id ${id}`,
+    );
+    return;
+  }
+
+  // Delete from the map first so a later duplicate line can never remove a
+  // different task's file or be delivered twice.
+  taskFiles.delete(id);
+  safeUnlink(taskPath, `task file for ${id}`);
+  deliverResult(pi, { id, summary: candidate.summary });
 }
 
 // ── parent setup ────────────────────────────────────────────────────
@@ -181,8 +283,9 @@ function setupParent(
   const sessionId = ctx.sessionManager.getSessionId();
   const sockPath = socketPathFor(sessionId);
 
-  // Remove stale socket from a previous (crashed/killed) run.
-  if (fs.existsSync(sockPath)) fs.unlinkSync(sockPath);
+  // Remove a stale socket left by a previous (crashed/killed) run. Tolerate
+  // an already-absent path; other failures are logged by safeUnlink.
+  safeUnlink(sockPath, "stale socket");
 
   // Track task files by subagent ID so a result cleans up exactly the
   // matching file regardless of completion order. An unknown or duplicate
@@ -198,30 +301,38 @@ function setupParent(
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
         if (line.length === 0) continue;
-        const payload = JSON.parse(line) as ResultPayload;
-
-        // Remove this id's task file only while we still track it. A missing
-        // entry (unknown id, or a duplicate result already delivered) must
-        // never delete another task's file.
-        const taskPath = taskFiles.get(payload.id);
-        if (taskPath !== undefined) {
-          taskFiles.delete(payload.id);
-          try {
-            fs.unlinkSync(taskPath);
-          } catch {
-            /* file already removed */
-          }
-        }
-
-        deliverResult(pi, payload);
+        // Each line is parsed and validated independently so a malformed or
+        // unknown-id payload never aborts the handler or blocks later lines.
+        processResultLine(pi, taskFiles, line);
       }
     });
   });
-  server.listen(sockPath, () => fs.chmodSync(sockPath, 0o600));
+
+  // A server 'error' (e.g. unable to bind the socket) is logged rather than
+  // thrown: the parent keeps running, but children will fail to connect and
+  // report that themselves. Mode 0o600 is enforced once listening starts.
+  server.on("error", (err) => {
+    console.error(`fork: result socket error: ${err}`);
+  });
+  server.listen(sockPath, () => {
+    try {
+      fs.chmodSync(sockPath, 0o600);
+    } catch (err) {
+      console.error(`fork: could not chmod socket ${sockPath}: ${err}`);
+    }
+  });
 
   pi.on("session_shutdown", () => {
-    server.close();
-    fs.unlinkSync(sockPath);
+    // close() with a callback absorbs ERR_SERVER_NOT_RUNNING (never-listened
+    // or already-closed) instead of emitting an unhandled 'error'. The
+    // socket file is removed best-effort and must not throw if it was never
+    // created or already removed.
+    server.close((err) => {
+      if (err && err.code !== "ERR_SERVER_NOT_RUNNING") {
+        console.error(`fork: error closing result socket server: ${err}`);
+      }
+    });
+    safeUnlink(sockPath, "result socket");
   });
 
   pi.registerTool({
@@ -247,11 +358,20 @@ function setupParent(
     }),
     execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
       const { task } = params as { task: string };
-      const id = newSubagentId();
+      const id = newSubagentId(taskFiles);
       const taskPath = path.join(TASKS_DIR, `${id}.md`);
       fs.writeFileSync(taskPath, task, { mode: 0o600 });
       taskFiles.set(id, taskPath);
-      spawn(session, sessionId, id, taskPath, toolCtx.cwd);
+      try {
+        spawn(session, sessionId, id, taskPath, toolCtx.cwd);
+      } catch (err) {
+        // Spawning failed after the task was created and tracked: roll back
+        // exactly this id's state so pi reports the spawn error. A cleanup
+        // failure is logged but must not mask the original error.
+        taskFiles.delete(id);
+        safeUnlink(taskPath, `task file for ${id}`);
+        throw err;
+      }
       return {
         content: [
           {
@@ -331,13 +451,40 @@ async function setupChild(
       .map((c: any) => c.text)
       .join("\n");
 
+    const payload = `${JSON.stringify({ id: subagentId, summary })}\n`;
+
+    // Deliver over the parent socket without ever throwing from a callback.
+    // Only a successful flush counts as delivery; if the result cannot reach
+    // the parent we report the failure visibly and still shut down. `settled`
+    // prevents double-handling when several terminal events fire (e.g. error
+    // after timeout).
+    let settled = false;
+    const finish = (delivered: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (!delivered) {
+        ctx.ui.notify(
+          "fork: could not deliver result to parent (socket unavailable); " +
+            "the result was not sent.",
+          "error",
+        );
+      }
+      ctx.shutdown();
+    };
+
     const socket = net.connect(socketPath);
+    socket.setTimeout(5000);
     socket.on("error", (err) => {
-      throw err;
+      console.error(`fork: failed to send result to parent: ${err}`);
+      socket.destroy();
+      finish(false);
     });
-    socket.end(`${JSON.stringify({ id: subagentId, summary })}\n`, () =>
-      ctx.shutdown(),
-    );
+    socket.on("timeout", () => {
+      console.error("fork: timed out sending result to parent");
+      socket.destroy();
+      finish(false);
+    });
+    socket.end(payload, () => finish(true));
   });
 }
 
