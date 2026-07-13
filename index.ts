@@ -401,25 +401,17 @@ async function setupChild(
   // "stop"; any other terminus clears it, so an interrupted/failed run is
   // never reported and leaves no stale earlier result.
   //
-  // Once the human interrupts or steers the child, it has been taken over.
-  // Its later answers are interactive replies, not task completion summaries.
-  // This restores the session-scoped abort guard removed with the old result
-  // state machinery.
+  // An interrupted run's next clean reply is an interactive answer, not the
+  // task completion summary. Suppress that reply once; a later clean run may
+  // still complete the task normally.
   //
   // `deliveryStarted` guarantees at most one socket send per session, even if
   // several runs settle before the async flush/shutdown complete. The
   // per-attempt `settled` below keeps the error/timeout/flush callbacks from
   // double-finishing one attempt.
   let pendingSummary: string | null = null;
-  let takenOver = false;
+  let suppressNextReply = false;
   let deliveryStarted = false;
-
-  pi.on("input", (event) => {
-    if (event.source === "interactive" && event.streamingBehavior === "steer") {
-      takenOver = true;
-      pendingSummary = null;
-    }
-  });
 
   pi.on("agent_end", (event) => {
     const last = [...event.messages]
@@ -433,11 +425,12 @@ async function setupChild(
       | undefined;
 
     if (!last || last.stopReason !== "stop") {
-      if (last?.stopReason === "aborted") takenOver = true;
+      if (last?.stopReason === "aborted") suppressNextReply = true;
       pendingSummary = null;
       return;
     }
-    if (takenOver) {
+    if (suppressNextReply) {
+      suppressNextReply = false;
       pendingSummary = null;
       return;
     }
@@ -450,7 +443,6 @@ async function setupChild(
   pi.on("agent_settled", (_event, ctx) => {
     if (
       deliveryStarted ||
-      takenOver ||
       pendingSummary === null ||
       ctx.hasPendingMessages()
     ) {
