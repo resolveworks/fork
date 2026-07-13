@@ -37,11 +37,8 @@ function inTmux(): boolean {
   return !!process.env.TMUX;
 }
 
-/**
- * Run a tmux command synchronously with argv passed directly (no shell), so
- * session names, paths, and arguments containing spaces or metacharacters
- * are never shell-interpreted. Throws on failure and preserves a timeout.
- */
+/** Run tmux synchronously with argv passed directly (no shell), so paths and
+ * arguments with spaces/metacharacters are never shell-interpreted. */
 function tmuxSync(args: string[], timeout = 3000): string {
   const result = spawnSync("tmux", args, { encoding: "utf-8", timeout });
   if (result.error) throw result.error;
@@ -75,12 +72,25 @@ function socketPathFor(sessionId: string): string {
   return path.join(SOCKETS_DIR, `${sessionId}.sock`);
 }
 
+function taskPathFor(id: string): string {
+  return path.join(TASKS_DIR, `${id}.md`);
+}
+
+function loadActiveIds(): Set<string> {
+  const uuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.md$/;
+  return new Set(
+    fs
+      .readdirSync(TASKS_DIR)
+      .filter((name) => uuid.test(name))
+      .map((name) => name.slice(0, -3)),
+  );
+}
+
 // ── result payload (child → parent over socket) ─────────────────────
 
 interface ResultPayload {
-  /** Unique ID of the subagent that produced this result. */
   id: string;
-  /** Final textual response from the subagent. */
   summary: string;
 }
 
@@ -89,7 +99,6 @@ interface ResultPayload {
 interface ForkConfig {
   /** Model id or pattern (supports `provider/id` and `:thinking`). */
   model?: string;
-  /** Provider name, e.g. "anthropic" or "zai". */
   provider?: string;
   /** Thinking level applied via setThinkingLevel. */
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -114,45 +123,7 @@ function loadConfig(cwd: string, projectTrusted: boolean): ForkConfig {
   return { ...globalCfg, ...projectCfg };
 }
 
-/**
- * Seed the global fork.json with the current model so the plugin is useful
- * out of the box. Only writes if the file does not yet exist; never overwrites
- * a user's config.
- */
-function seedConfig(model: { provider: string; id: string }): void {
-  const file = path.join(getAgentDir(), "fork.json");
-  if (fs.existsSync(file)) return;
-  const seeded: ForkConfig = { provider: model.provider, model: model.id };
-  try {
-    fs.writeFileSync(file, `${JSON.stringify(seeded, null, 2)}\n`);
-    console.error(
-      `fork: created ${file} with ${seeded.provider}/${seeded.model}`,
-    );
-  } catch (err) {
-    console.error(`fork: failed to create ${file}: ${err}`);
-  }
-}
-
 // ── spawn (fire-and-forget) ─────────────────────────────────────────
-
-/**
- * Generate a fresh subagent ID. UUID v4 provides ~122 bits of entropy, so
- * collisions are astronomically unlikely — but not impossible — so we
- * confirm the ID is neither tracked nor an existing task file before use
- * and regenerate otherwise. The ID is the task filename, the tmux window
- * name, and the routing key carried in the child's result payload.
- */
-function newSubagentId(taskFiles: Map<string, string>): string {
-  for (;;) {
-    const id = randomUUID();
-    if (
-      !taskFiles.has(id) &&
-      !fs.existsSync(path.join(TASKS_DIR, `${id}.md`))
-    ) {
-      return id;
-    }
-  }
-}
 
 function spawn(
   session: string,
@@ -161,9 +132,8 @@ function spawn(
   taskPath: string,
   cwd: string,
 ): void {
-  // Pass the child command and each argument as distinct argv entries.
-  // tmux runs a multi-argument shell-command directly (without `sh -c`), so
-  // paths/IDs with spaces or metacharacters need no shell quoting.
+  // argv passed directly; tmux runs a multi-arg command without `sh -c`, so
+  // no shell quoting is needed.
   const cmdArgs = [
     "pi",
     "--subagent-socket",
@@ -199,11 +169,8 @@ function deliverResult(pi: ExtensionAPI, payload: ResultPayload): void {
   );
 }
 
-/**
- * Remove a file, tolerating an already-missing path. Unexpected filesystem
- * failures are logged but never thrown — callers (result delivery, socket
- * teardown) must keep working.
- */
+/** Remove a file, tolerating an already-missing path. Never throws —
+ * callers (result delivery, socket teardown) must keep working. */
 function safeUnlink(filePath: string, what: string): void {
   try {
     fs.unlinkSync(filePath);
@@ -214,15 +181,14 @@ function safeUnlink(filePath: string, what: string): void {
 }
 
 /**
- * Parse and act on a single newline-delimited result line. Each line is
- * independent: malformed JSON or payload shape is logged and ignored
- * without aborting the data handler or dropping later lines. Only a
- * currently-tracked id is delivered — exactly once — and only its own task
- * file is removed; unknown or duplicate ids are logged and ignored.
+ * Parse and act on one newline-delimited result line. Malformed JSON or shape
+ * is logged and ignored without aborting the handler or dropping later lines.
+ * A currently-tracked id is delivered exactly once and its task file removed;
+ * unknown or duplicate ids are logged and ignored.
  */
 function processResultLine(
   pi: ExtensionAPI,
-  taskFiles: Map<string, string>,
+  activeIds: Set<string>,
   line: string,
 ): void {
   let parsed: unknown;
@@ -248,18 +214,16 @@ function processResultLine(
   }
 
   const id = candidate.id;
-  const taskPath = taskFiles.get(id);
-  if (taskPath === undefined) {
+  if (!activeIds.has(id)) {
     console.error(
       `fork: ignoring result for unknown or already-delivered id ${id}`,
     );
     return;
   }
 
-  // Delete from the map first so a later duplicate line can never remove a
-  // different task's file or be delivered twice.
-  taskFiles.delete(id);
-  safeUnlink(taskPath, `task file for ${id}`);
+  // Delete first so a duplicate line is never delivered twice.
+  activeIds.delete(id);
+  safeUnlink(taskPathFor(id), `task file for ${id}`);
   deliverResult(pi, { id, summary: candidate.summary });
 }
 
@@ -267,30 +231,21 @@ function processResultLine(
 
 function setupParent(
   pi: ExtensionAPI,
-  ctx: {
-    sessionManager: { getSessionId: () => string };
-    model: { provider: string; id: string } | undefined;
-  },
+  ctx: { sessionManager: { getSessionId: () => string } },
 ): void {
   fs.mkdirSync(SOCKETS_DIR, { recursive: true });
   fs.mkdirSync(TASKS_DIR, { recursive: true });
-
-  // First run: seed ~/.pi/agent/fork.json with the current model so the
-  // plugin works out of the box. Never overwrites an existing file.
-  if (ctx.model) seedConfig(ctx.model);
 
   const session = tmuxSession();
   const sessionId = ctx.sessionManager.getSessionId();
   const sockPath = socketPathFor(sessionId);
 
-  // Remove a stale socket left by a previous (crashed/killed) run. Tolerate
-  // an already-absent path; other failures are logged by safeUnlink.
+  // Remove a stale socket left by a previous (crashed/killed) run.
   safeUnlink(sockPath, "stale socket");
 
-  // Track task files by subagent ID so a result cleans up exactly the
-  // matching file regardless of completion order. An unknown or duplicate
-  // result id simply finds no entry here and deletes nothing.
-  const taskFiles = new Map<string, string>();
+  // Task files survive extension reloads, so rebuild the active set from them.
+  // This lets already-running children report back to the reloaded parent.
+  const activeIds = loadActiveIds();
 
   const server = net.createServer((socket) => {
     let buf = "";
@@ -301,16 +256,14 @@ function setupParent(
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
         if (line.length === 0) continue;
-        // Each line is parsed and validated independently so a malformed or
-        // unknown-id payload never aborts the handler or blocks later lines.
-        processResultLine(pi, taskFiles, line);
+        processResultLine(pi, activeIds, line);
       }
     });
   });
 
-  // A server 'error' (e.g. unable to bind the socket) is logged rather than
-  // thrown: the parent keeps running, but children will fail to connect and
-  // report that themselves. Mode 0o600 is enforced once listening starts.
+  // A server 'error' (e.g. unable to bind) is logged, not thrown: the parent
+  // keeps running; children fail to connect and report that themselves.
+  // Mode 0o600 is enforced once listening starts.
   server.on("error", (err) => {
     console.error(`fork: result socket error: ${err}`);
   });
@@ -323,10 +276,8 @@ function setupParent(
   });
 
   pi.on("session_shutdown", () => {
-    // close() with a callback absorbs ERR_SERVER_NOT_RUNNING (never-listened
-    // or already-closed) instead of emitting an unhandled 'error'. The
-    // socket file is removed best-effort and must not throw if it was never
-    // created or already removed.
+    // close() with a callback absorbs ERR_SERVER_NOT_RUNNING instead of
+    // emitting an unhandled 'error'.
     server.close((err) => {
       if (err && err.code !== "ERR_SERVER_NOT_RUNNING") {
         console.error(`fork: error closing result socket server: ${err}`);
@@ -341,9 +292,10 @@ function setupParent(
     description:
       "Spawn a pi subagent in a new tmux window. Returns immediately " +
       "(asynchronous); the subagent runs as a fresh pi session and cannot see " +
-      "this conversation, your reasoning, or prior tool results. It starts in the " +
-      "current working directory and shares the same filesystem — it is not an " +
-      "isolated copy, so its edits are live. Concurrent subagents may finish in " +
+      "this conversation, your reasoning, or prior tool results. Pi still loads " +
+      "normal project context for the working directory, including applicable " +
+      "AGENTS.md files. It shares the same filesystem — it is not isolated, so " +
+      "its edits are live. Concurrent subagents may finish in " +
       "any order; do not assign overlapping file edits to concurrent subagents, " +
       "as they can conflict. Do not wait, sleep, poll, or check on a spawned " +
       "subagent. Continue with independent work or end your response; when the " +
@@ -352,25 +304,24 @@ function setupParent(
     parameters: Type.Object({
       task: Type.String({
         description:
-          "Complete, self-contained instructions for the subagent. The subagent " +
-          "cannot see this conversation, so include everything it needs: goal, " +
-          "relevant context and constraints, exact file paths, and the expected " +
-          "output. The task is passed directly to the subagent as its initial prompt.",
+          "Task-specific instructions for the subagent. Pi automatically loads " +
+          "normal project context, including applicable AGENTS.md files, so do not " +
+          "repeat it. Include the goal, context unavailable there, task-specific " +
+          "constraints, relevant file paths, and expected output. The task is passed " +
+          "directly to the subagent as its initial prompt.",
       }),
     }),
     execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
       const { task } = params as { task: string };
-      const id = newSubagentId(taskFiles);
-      const taskPath = path.join(TASKS_DIR, `${id}.md`);
+      const id = randomUUID();
+      const taskPath = taskPathFor(id);
       fs.writeFileSync(taskPath, task, { mode: 0o600 });
-      taskFiles.set(id, taskPath);
+      activeIds.add(id);
       try {
         spawn(session, sessionId, id, taskPath, toolCtx.cwd);
       } catch (err) {
-        // Spawning failed after the task was created and tracked: roll back
-        // exactly this id's state so pi reports the spawn error. A cleanup
-        // failure is logged but must not mask the original error.
-        taskFiles.delete(id);
+        // Roll back exactly this id's state so pi reports the spawn error.
+        activeIds.delete(id);
         safeUnlink(taskPath, `task file for ${id}`);
         throw err;
       }
@@ -394,9 +345,10 @@ function setupParent(
 
 const SUBAGENT_SYSTEM_PROMPT =
   "You are a subagent spawned by a parent pi process. " +
-  "You do not share the parent's conversation, reasoning, or tool results — " +
-  "work only from the task you were given. You run in the parent's working " +
-  "tree (the same filesystem), so your edits are live. " +
+  "You do not share the parent's conversation, reasoning, or tool results. " +
+  "Follow the delegated task alongside the normal project context loaded by pi, " +
+  "including applicable AGENTS.md files. You run in the parent's working tree " +
+  "(the same filesystem), so your edits are live. " +
   "Focus exclusively on the assigned task; do not spawn subagents or delegate work. " +
   "When you are done, end your response with a clear summary. Only the text of " +
   "your final message is sent back to the parent.";
@@ -407,9 +359,8 @@ async function setupChild(
   socketPath: string,
   subagentId: string,
 ): Promise<void> {
-  // Apply the configured subagent model. The child resolves it through the
-  // model registry — same rules as `pi --model` (provider/id, :thinking,
-  // fuzzy matching) — so the parent never has to forward flags.
+  // The child resolves the configured model through the model registry —
+  // same rules as `pi --model` — so the parent never forwards flags.
   const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
   if (config.model) {
     const result = resolveCliModel({
@@ -439,7 +390,7 @@ async function setupChild(
 
   pi.on("before_agent_start", (event) => {
     return {
-      systemPrompt: event.systemPrompt + "\n\n" + SUBAGENT_SYSTEM_PROMPT,
+      systemPrompt: `${event.systemPrompt}\n\n${SUBAGENT_SYSTEM_PROMPT}`,
     };
   });
 
@@ -451,16 +402,14 @@ async function setupChild(
   // there and initiate delivery from agent_settled, which fires once pi has
   // no automatic continuation left.
   //
-  // `pendingSummary` holds the text of the most recent assistant message with
-  // stopReason "stop"; any other terminus (abort/error/length, or no assistant
-  // message at all) clears it, so an interrupted or failed run is never
-  // reported and cannot leave a stale earlier result to be sent.
+  // `pendingSummary` holds the most recent assistant message with stopReason
+  // "stop"; any other terminus clears it, so an interrupted/failed run is
+  // never reported and leaves no stale earlier result.
   //
-  // `deliveryStarted` is session-scoped: it guarantees at most one socket send
-  // attempt for the whole child session, even if several runs settle before
-  // the (asynchronous) socket flush and shutdown complete. The per-attempt
-  // `settled` flag below additionally keeps the error, timeout, and flush
-  // callbacks from each finishing the same attempt.
+  // `deliveryStarted` guarantees at most one socket send per session, even if
+  // several runs settle before the async flush/shutdown complete. The
+  // per-attempt `settled` below keeps the error/timeout/flush callbacks from
+  // double-finishing one attempt.
   let pendingSummary: string | null = null;
   let deliveryStarted = false;
 
@@ -486,9 +435,6 @@ async function setupChild(
   });
 
   pi.on("agent_settled", (_event, ctx) => {
-    // agent_settled fires only after retries, compaction, and queued
-    // continuations have drained; hasPendingMessages is a defensive guard.
-    // deliveryStarted guarantees we attempt at most one send per session.
     if (
       deliveryStarted ||
       pendingSummary === null ||
@@ -500,11 +446,9 @@ async function setupChild(
 
     const payload = `${JSON.stringify({ id: subagentId, summary: pendingSummary })}\n`;
 
-    // Deliver over the parent socket without ever throwing from a callback.
-    // Only a successful flush counts as delivery; if the result cannot reach
-    // the parent we report the failure visibly and still shut down. `settled`
-    // prevents double-handling when several terminal events fire (e.g. error
-    // after timeout).
+    // Only a successful flush counts as delivery; otherwise we report the
+    // failure visibly and still shut down. `settled` prevents double-handling
+    // when several terminal events fire (e.g. error after timeout).
     let settled = false;
     const finish = (delivered: boolean) => {
       if (settled) return;
