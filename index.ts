@@ -76,16 +76,9 @@ function taskPathFor(id: string): string {
   return path.join(TASKS_DIR, `${id}.md`);
 }
 
-function loadActiveIds(): Set<string> {
-  const uuid =
-    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.md$/;
-  return new Set(
-    fs
-      .readdirSync(TASKS_DIR)
-      .filter((name) => uuid.test(name))
-      .map((name) => name.slice(0, -3)),
-  );
-}
+/** Exact lowercase format emitted by randomUUID(); also blocks path traversal. */
+const UUID_V4 =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 // ── result payload (child → parent over socket) ─────────────────────
 
@@ -170,7 +163,7 @@ function deliverResult(pi: ExtensionAPI, payload: ResultPayload): void {
 }
 
 /** Remove a file, tolerating an already-missing path. Never throws —
- * callers (result delivery, socket teardown) must keep working. */
+ * callers (spawn rollback, socket teardown) must keep working. */
 function safeUnlink(filePath: string, what: string): void {
   try {
     fs.unlinkSync(filePath);
@@ -183,14 +176,10 @@ function safeUnlink(filePath: string, what: string): void {
 /**
  * Parse and act on one newline-delimited result line. Malformed JSON or shape
  * is logged and ignored without aborting the handler or dropping later lines.
- * A currently-tracked id is delivered exactly once and its task file removed;
- * unknown or duplicate ids are logged and ignored.
+ * Removing the validated id's task file atomically claims the result, so only
+ * the first result for a pending task is delivered.
  */
-function processResultLine(
-  pi: ExtensionAPI,
-  activeIds: Set<string>,
-  line: string,
-): void {
+function processResultLine(pi: ExtensionAPI, line: string): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(line);
@@ -214,16 +203,27 @@ function processResultLine(
   }
 
   const id = candidate.id;
-  if (!activeIds.has(id)) {
+  if (!UUID_V4.test(id)) {
     console.error(
-      `fork: ignoring result for unknown or already-delivered id ${id}`,
+      `fork: ignoring result with invalid subagent id (not a UUID v4): ${id}`,
     );
     return;
   }
 
-  // Delete first so a duplicate line is never delivered twice.
-  activeIds.delete(id);
-  safeUnlink(taskPathFor(id), `task file for ${id}`);
+  // Unlink is both the pending check and atomic claim; do not check existence first.
+  try {
+    fs.unlinkSync(taskPathFor(id));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      console.error(
+        `fork: ignoring result for unknown or already-delivered id ${id}`,
+      );
+    } else {
+      console.error(`fork: could not claim task file for ${id}: ${err}`);
+    }
+    return;
+  }
+
   deliverResult(pi, { id, summary: candidate.summary });
 }
 
@@ -243,10 +243,7 @@ function setupParent(
   // Remove a stale socket left by a previous (crashed/killed) run.
   safeUnlink(sockPath, "stale socket");
 
-  // Task files survive extension reloads, so rebuild the active set from them.
-  // This lets already-running children report back to the reloaded parent.
-  const activeIds = loadActiveIds();
-
+  // Task files are authoritative, so running children survive extension reloads.
   const server = net.createServer((socket) => {
     let buf = "";
     socket.setEncoding("utf-8");
@@ -256,7 +253,7 @@ function setupParent(
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
         if (line.length === 0) continue;
-        processResultLine(pi, activeIds, line);
+        processResultLine(pi, line);
       }
     });
   });
@@ -316,12 +313,10 @@ function setupParent(
       const id = randomUUID();
       const taskPath = taskPathFor(id);
       fs.writeFileSync(taskPath, task, { mode: 0o600 });
-      activeIds.add(id);
       try {
         spawn(session, sessionId, id, taskPath, toolCtx.cwd);
       } catch (err) {
-        // Roll back exactly this id's state so pi reports the spawn error.
-        activeIds.delete(id);
+        // Roll back exactly this id's task file so pi reports the spawn error.
         safeUnlink(taskPath, `task file for ${id}`);
         throw err;
       }
