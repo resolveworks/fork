@@ -7,6 +7,12 @@
  * over a Unix socket and delivered as a notification that triggers a
  * new turn.
  *
+ * Configure the subagent model via ~/.pi/agent/fork.json (global) or
+ * .pi/fork.json (project, overrides global). Any field is optional:
+ *   { "model": "glm-5.2", "provider": "zai", "thinking": "high" }
+ * The child reads this itself and applies the model through the model
+ * registry, using the same resolution rules as `pi --model`.
+ *
  * Requires: run pi inside tmux.
  */
 
@@ -15,7 +21,13 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  CONFIG_DIR_NAME,
+  type ExtensionAPI,
+  type ExtensionContext,
+  getAgentDir,
+  resolveCliModel,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 // ── tmux ────────────────────────────────────────────────────────────
@@ -46,6 +58,36 @@ function socketPathFor(sessionId: string): string {
 
 interface ResultPayload {
   summary: string;
+}
+
+// ── config (~/.pi/agent/fork.json, .pi/fork.json) ───────────────────
+
+interface ForkConfig {
+  /** Model id or pattern (supports `provider/id` and `:thinking`). */
+  model?: string;
+  /** Provider name, e.g. "anthropic" or "zai". */
+  provider?: string;
+  /** Thinking level applied via setThinkingLevel. */
+  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+}
+
+function readConfig(file: string): ForkConfig {
+  try {
+    if (!fs.existsSync(file)) return {};
+    return JSON.parse(fs.readFileSync(file, "utf-8")) as ForkConfig;
+  } catch (err) {
+    console.error(`fork: failed to load ${file}: ${err}`);
+    return {};
+  }
+}
+
+/** Merge global + project config. Project wins; only read if trusted. */
+function loadConfig(cwd: string, projectTrusted: boolean): ForkConfig {
+  const globalCfg = readConfig(path.join(getAgentDir(), "fork.json"));
+  const projectCfg = projectTrusted
+    ? readConfig(path.join(cwd, CONFIG_DIR_NAME, "fork.json"))
+    : {};
+  return { ...globalCfg, ...projectCfg };
 }
 
 // ── spawn (fire-and-forget) ─────────────────────────────────────────
@@ -171,7 +213,41 @@ const SUBAGENT_SYSTEM_PROMPT =
   "your final message is sent back to the parent. " +
   "Do not attempt to spawn subagents or delegate work.";
 
-function setupChild(pi: ExtensionAPI, socketPath: string): void {
+async function setupChild(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  socketPath: string,
+): Promise<void> {
+  // Apply the configured subagent model. The child resolves it through the
+  // model registry — same rules as `pi --model` (provider/id, :thinking,
+  // fuzzy matching) — so the parent never has to forward flags.
+  const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+  if (config.model) {
+    const result = resolveCliModel({
+      cliProvider: config.provider,
+      cliModel: config.model,
+      modelRegistry: ctx.modelRegistry,
+    });
+    if (result.model) {
+      const ok = await pi.setModel(result.model);
+      if (!ok) {
+        ctx.ui.notify(
+          `fork: no API key for subagent model ${config.provider ? `${config.provider}/` : ""}${config.model}`,
+          "warning",
+        );
+      }
+    } else {
+      ctx.ui.notify(
+        `fork: could not resolve subagent model: ${result.error ?? result.warning ?? "not found"}`,
+        "warning",
+      );
+    }
+    const thinking = config.thinking ?? result.thinkingLevel;
+    if (thinking) pi.setThinkingLevel(thinking);
+  } else if (config.thinking) {
+    pi.setThinkingLevel(config.thinking);
+  }
+
   pi.on("before_agent_start", (event) => {
     return {
       systemPrompt: event.systemPrompt + "\n\n" + SUBAGENT_SYSTEM_PROMPT,
@@ -210,7 +286,7 @@ export default function (pi: ExtensionAPI) {
     type: "string",
   });
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     const socketPath = pi.getFlag("subagent-socket") as string | undefined;
 
     if (socketPath === undefined) {
@@ -220,6 +296,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Child mode
-    setupChild(pi, socketPath);
+    await setupChild(pi, ctx, socketPath);
   });
 }
