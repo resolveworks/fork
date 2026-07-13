@@ -201,14 +201,21 @@ function setupParent(
     name: "spawn",
     label: "Spawn",
     description:
-      "Spawn a pi subagent in a new tmux window. Returns immediately. " +
-      "The subagent's final output is delivered as a notification when it finishes, " +
-      "triggering a new turn with the results.",
+      "Spawn a pi subagent in a new tmux window. Returns immediately " +
+      "(asynchronous); the subagent runs as a fresh pi session and cannot see " +
+      "this conversation, your reasoning, or prior tool results. It starts in the " +
+      "current working directory and shares the same filesystem — it is not an " +
+      "isolated copy, so its edits are live. Concurrent subagents may finish in " +
+      "any order; do not assign overlapping file edits to concurrent subagents, " +
+      "as they can conflict. When it finishes, only the subagent's final textual " +
+      "response is delivered asynchronously into your context.",
     parameters: Type.Object({
       task: Type.String({
         description:
-          "Complete task instructions for the subagent. " +
-          "The content is written to a task file and passed directly to the subagent as its input.",
+          "Complete, self-contained instructions for the subagent. The subagent " +
+          "cannot see this conversation, so include everything it needs: goal, " +
+          "relevant context and constraints, exact file paths, and the expected " +
+          "output. The task is passed directly to the subagent as its initial prompt.",
       }),
     }),
     execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
@@ -234,10 +241,12 @@ function setupParent(
 
 const SUBAGENT_SYSTEM_PROMPT =
   "You are a subagent spawned by a parent pi process. " +
-  "Focus exclusively on the assigned task. " +
-  "When you are done, end your response with a clear summary — " +
-  "your final message is sent back to the parent. " +
-  "Do not attempt to spawn subagents or delegate work.";
+  "You do not share the parent's conversation, reasoning, or tool results — " +
+  "work only from the task you were given. You run in the parent's working " +
+  "tree (the same filesystem), so your edits are live. " +
+  "Focus exclusively on the assigned task; do not spawn subagents or delegate work. " +
+  "When you are done, end your response with a clear summary. Only the text of " +
+  "your final message is sent back to the parent.";
 
 async function setupChild(
   pi: ExtensionAPI,
