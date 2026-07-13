@@ -17,6 +17,7 @@
  */
 
 import { execSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -57,6 +58,9 @@ function socketPathFor(sessionId: string): string {
 // ── result payload (child → parent over socket) ─────────────────────
 
 interface ResultPayload {
+  /** Unique ID of the subagent that produced this result. */
+  id: string;
+  /** Final textual response from the subagent. */
   summary: string;
 }
 
@@ -111,17 +115,29 @@ function seedConfig(model: { provider: string; id: string }): void {
 
 // ── spawn (fire-and-forget) ─────────────────────────────────────────
 
+/**
+ * Generate a unique subagent ID. Combines a millisecond timestamp with
+ * random entropy so two rapid spawns can never collide. The ID is used as
+ * the task filename, the tmux window name, and the routing key carried in
+ * the child's result payload.
+ */
+function newSubagentId(): string {
+  return `pi-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
+}
+
 function spawn(
   session: string,
   sessionId: string,
+  id: string,
   taskPath: string,
   cwd: string,
 ): void {
-  const id = path.basename(taskPath, ".md");
   const cmdArgs = [
     "pi",
     "--subagent-socket",
     socketPathFor(sessionId),
+    "--subagent-id",
+    id,
     `@${taskPath}`,
   ];
 
@@ -133,17 +149,12 @@ function spawn(
 
 // ── result delivery ─────────────────────────────────────────────────
 
-function deliverResult(
-  pi: ExtensionAPI,
-  payload: ResultPayload,
-  taskPath: string,
-): void {
-  if (taskPath) fs.unlinkSync(taskPath);
-
+function deliverResult(pi: ExtensionAPI, payload: ResultPayload): void {
+  const summary = payload.summary.trim() || "(no output)";
   pi.sendMessage(
     {
       customType: RESULT_TYPE,
-      content: payload.summary || "(no output)",
+      content: `Subagent ${payload.id} finished:\n\n${summary}`,
       display: true,
     },
     { triggerTurn: true },
@@ -173,8 +184,10 @@ function setupParent(
   // Remove stale socket from a previous (crashed/killed) run.
   if (fs.existsSync(sockPath)) fs.unlinkSync(sockPath);
 
-  // Track task files so we can clean them up when results arrive.
-  const taskFiles: string[] = [];
+  // Track task files by subagent ID so a result cleans up exactly the
+  // matching file regardless of completion order. An unknown or duplicate
+  // result id simply finds no entry here and deletes nothing.
+  const taskFiles = new Map<string, string>();
 
   const server = net.createServer((socket) => {
     let buf = "";
@@ -185,8 +198,22 @@ function setupParent(
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
         if (line.length === 0) continue;
-        const taskPath = taskFiles.shift() ?? "";
-        deliverResult(pi, JSON.parse(line) as ResultPayload, taskPath);
+        const payload = JSON.parse(line) as ResultPayload;
+
+        // Remove this id's task file only while we still track it. A missing
+        // entry (unknown id, or a duplicate result already delivered) must
+        // never delete another task's file.
+        const taskPath = taskFiles.get(payload.id);
+        if (taskPath !== undefined) {
+          taskFiles.delete(payload.id);
+          try {
+            fs.unlinkSync(taskPath);
+          } catch {
+            /* file already removed */
+          }
+        }
+
+        deliverResult(pi, payload);
       }
     });
   });
@@ -220,16 +247,16 @@ function setupParent(
     }),
     execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
       const { task } = params as { task: string };
-      const id = `pi-${Date.now().toString(36)}`;
+      const id = newSubagentId();
       const taskPath = path.join(TASKS_DIR, `${id}.md`);
       fs.writeFileSync(taskPath, task, { mode: 0o600 });
-      taskFiles.push(taskPath);
-      spawn(session, sessionId, taskPath, toolCtx.cwd);
+      taskFiles.set(id, taskPath);
+      spawn(session, sessionId, id, taskPath, toolCtx.cwd);
       return {
         content: [
           {
             type: "text" as const,
-            text: task,
+            text: `Spawned subagent ${id} in ${toolCtx.cwd}. Its result will arrive asynchronously when the subagent finishes.`,
           },
         ],
       };
@@ -252,6 +279,7 @@ async function setupChild(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   socketPath: string,
+  subagentId: string,
 ): Promise<void> {
   // Apply the configured subagent model. The child resolves it through the
   // model registry — same rules as `pi --model` (provider/id, :thinking,
@@ -307,7 +335,9 @@ async function setupChild(
     socket.on("error", (err) => {
       throw err;
     });
-    socket.end(`${JSON.stringify({ summary })}\n`, () => ctx.shutdown());
+    socket.end(`${JSON.stringify({ id: subagentId, summary })}\n`, () =>
+      ctx.shutdown(),
+    );
   });
 }
 
@@ -321,6 +351,11 @@ export default function (pi: ExtensionAPI) {
     type: "string",
   });
 
+  pi.registerFlag("subagent-id", {
+    description: "Subagent ID for result routing (internal)",
+    type: "string",
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     const socketPath = pi.getFlag("subagent-socket") as string | undefined;
 
@@ -331,6 +366,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Child mode
-    await setupChild(pi, ctx, socketPath);
+    const subagentId = pi.getFlag("subagent-id") as string;
+    await setupChild(pi, ctx, socketPath, subagentId);
   });
 }
