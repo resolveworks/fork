@@ -288,24 +288,28 @@ function setupParent(
     label: "Spawn",
     description:
       "Spawn a pi subagent in a new tmux window. Returns immediately " +
-      "(asynchronous); the subagent runs as a fresh pi session and cannot see " +
-      "this conversation, your reasoning, or prior tool results. Pi still loads " +
-      "normal project context for the working directory, including applicable " +
-      "AGENTS.md files. It shares the same filesystem — it is not isolated, so " +
-      "its edits are live. Concurrent subagents may finish in " +
-      "any order; do not assign overlapping file edits to concurrent subagents, " +
-      "as they can conflict. Do not wait, sleep, poll, or check on a spawned " +
-      "subagent. Continue with independent work or end your response; when the " +
-      "subagent finishes, its final text is delivered automatically as a new " +
-      "message that triggers a new turn.",
+      "(asynchronous). The subagent runs as a fresh pi session: it cannot see " +
+      "this conversation, your reasoning, or prior tool results. The task you " +
+      "provide is its only conversation-specific context, so it must stand alone. " +
+      "Pi still loads normal project context for the working directory, including " +
+      "applicable AGENTS.md files. It shares the same filesystem — saved edits are " +
+      "visible and its edits are live, but unsaved reasoning and decisions are not. " +
+      "Concurrent subagents may finish in any order; do not assign overlapping file " +
+      "edits to concurrent subagents, as they can conflict. Do not wait, sleep, poll, " +
+      "or check on a spawned subagent. Continue with independent work or end your " +
+      "response; when the subagent finishes, its final text is delivered " +
+      "automatically as a new message that triggers a new turn.",
     parameters: Type.Object({
       task: Type.String({
         description:
-          "Task-specific instructions for the subagent. Pi automatically loads " +
-          "normal project context, including applicable AGENTS.md files, so do not " +
-          "repeat it. Include the goal, context unavailable there, task-specific " +
-          "constraints, relevant file paths, and expected output. The task is passed " +
-          "directly to the subagent as its initial prompt.",
+          "Write self-contained instructions for the subagent. It cannot see this " +
+          "conversation, so restate every conversation-specific detail it needs: " +
+          "the goal, prior findings or decisions, exact errors, constraints, and " +
+          "relevant file paths or symbols. Do not refer to 'the discussion above', " +
+          "'what we already tried', or other undeclared context. Pi automatically " +
+          "loads normal project context, including applicable AGENTS.md files, so " +
+          "do not repeat those instructions. Specify the expected output. The task " +
+          "is passed directly to the subagent as its initial prompt.",
       }),
     }),
     execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
