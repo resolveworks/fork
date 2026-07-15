@@ -348,7 +348,7 @@ const SUBAGENT_SYSTEM_PROMPT =
   "Follow the delegated task alongside the normal project context loaded by pi, " +
   "including applicable AGENTS.md files. You run in the parent's working tree " +
   "(the same filesystem), so your edits are live. " +
-  "Focus exclusively on the assigned task; do not spawn subagents or delegate work. " +
+  "Focus exclusively on the assigned task. " +
   "When you are done, end your response with a clear summary. Only the text of " +
   "your final message is sent back to the parent.";
 
