@@ -10,8 +10,8 @@
  * Configure the subagent model via ~/.pi/agent/fork.json (global) or
  * .pi/fork.json (project, overrides global). Any field is optional:
  *   { "model": "glm-5.2", "provider": "zai", "thinking": "high" }
- * The child reads this itself and applies the model through the model
- * registry, using the same resolution rules as `pi --model`.
+ * Fork passes these settings to the child pi process as CLI flags, so pi
+ * resolves them using its normal startup rules.
  *
  * Requires: run pi inside tmux.
  */
@@ -25,9 +25,7 @@ import * as path from "node:path";
 import {
   CONFIG_DIR_NAME,
   type ExtensionAPI,
-  type ExtensionContext,
   getAgentDir,
-  resolveCliModel,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -93,7 +91,7 @@ interface ForkConfig {
   /** Model id or pattern (supports `provider/id` and `:thinking`). */
   model?: string;
   provider?: string;
-  /** Thinking level applied via setThinkingLevel. */
+  /** Thinking level passed to the child via `--thinking`. */
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 }
 
@@ -124,17 +122,21 @@ function spawn(
   id: string,
   taskPath: string,
   cwd: string,
+  config: ForkConfig,
 ): void {
   // argv passed directly; tmux runs a multi-arg command without `sh -c`, so
-  // no shell quoting is needed.
+  // no shell quoting is needed. Let pi resolve model settings itself.
   const cmdArgs = [
     "pi",
     "--subagent-socket",
     socketPathFor(sessionId),
     "--subagent-id",
     id,
-    `@${taskPath}`,
   ];
+  if (config.provider) cmdArgs.push("--provider", config.provider);
+  if (config.model) cmdArgs.push("--model", config.model);
+  if (config.thinking) cmdArgs.push("--thinking", config.thinking);
+  cmdArgs.push(`@${taskPath}`);
 
   tmuxSync([
     "new-window",
@@ -312,7 +314,8 @@ function setupParent(
       const taskPath = taskPathFor(id);
       fs.writeFileSync(taskPath, task, { mode: 0o600 });
       try {
-        spawn(session, sessionId, id, taskPath, toolCtx.cwd);
+        const config = loadConfig(toolCtx.cwd, toolCtx.isProjectTrusted());
+        spawn(session, sessionId, id, taskPath, toolCtx.cwd, config);
       } catch (err) {
         // Roll back exactly this id's task file so pi reports the spawn error.
         safeUnlink(taskPath, `task file for ${id}`);
@@ -345,41 +348,11 @@ const SUBAGENT_SYSTEM_PROMPT =
   "complete the task. If the user explicitly asks you to return current findings, " +
   "call complete_task even if the task is incomplete.";
 
-async function setupChild(
+function setupChild(
   pi: ExtensionAPI,
-  ctx: ExtensionContext,
   socketPath: string,
   subagentId: string,
-): Promise<void> {
-  // The child resolves the configured model through the model registry —
-  // same rules as `pi --model` — so the parent never forwards flags.
-  const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
-  if (config.model) {
-    const result = resolveCliModel({
-      cliProvider: config.provider,
-      cliModel: config.model,
-      modelRegistry: ctx.modelRegistry,
-    });
-    if (result.model) {
-      const ok = await pi.setModel(result.model);
-      if (!ok) {
-        ctx.ui.notify(
-          `fork: no API key for subagent model ${config.provider ? `${config.provider}/` : ""}${config.model}`,
-          "warning",
-        );
-      }
-    } else {
-      ctx.ui.notify(
-        `fork: could not resolve subagent model: ${result.error ?? result.warning ?? "not found"}`,
-        "warning",
-      );
-    }
-    const thinking = config.thinking ?? result.thinkingLevel;
-    if (thinking) pi.setThinkingLevel(thinking);
-  } else if (config.thinking) {
-    pi.setThinkingLevel(config.thinking);
-  }
-
+): void {
   pi.on("before_agent_start", (event) => {
     return {
       systemPrompt: `${event.systemPrompt}\n\n${SUBAGENT_SYSTEM_PROMPT}`,
@@ -492,7 +465,7 @@ export default function (pi: ExtensionAPI) {
     type: "string",
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", (_event, ctx) => {
     const socketPath = pi.getFlag("subagent-socket") as string | undefined;
 
     if (socketPath === undefined) {
@@ -503,6 +476,6 @@ export default function (pi: ExtensionAPI) {
 
     // Child mode
     const subagentId = pi.getFlag("subagent-id") as string;
-    await setupChild(pi, ctx, socketPath, subagentId);
+    setupChild(pi, socketPath, subagentId);
   });
 }
