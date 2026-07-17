@@ -3,9 +3,9 @@
  *
  * The parent registers a single `spawn` tool. Calling it opens a new
  * tmux window running pi with the given task and returns immediately.
- * When the child finishes, its final assistant message is sent back
- * over a Unix socket and delivered as a notification that triggers a
- * new turn.
+ * When the child completes its task, it explicitly sends its result through
+ * a terminal tool. The result is delivered over a Unix socket as a
+ * notification that triggers a new parent turn.
  *
  * Configure the subagent model via ~/.pi/agent/fork.json (global) or
  * .pi/fork.json (project, overrides global). Any field is optional:
@@ -247,6 +247,9 @@ function setupParent(
   const server = net.createServer((socket) => {
     let buf = "";
     socket.setEncoding("utf-8");
+    socket.on("error", (err) => {
+      console.error(`fork: result socket connection error: ${err}`);
+    });
     socket.on("data", (chunk: string) => {
       buf += chunk;
       for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
@@ -287,29 +290,20 @@ function setupParent(
     name: "spawn",
     label: "Spawn",
     description:
-      "Spawn a pi subagent in a new tmux window. Returns immediately " +
-      "(asynchronous). The subagent runs as a fresh pi session: it cannot see " +
-      "this conversation, your reasoning, or prior tool results. The task you " +
-      "provide is its only conversation-specific context, so it must stand alone. " +
-      "Pi still loads normal project context for the working directory, including " +
-      "applicable AGENTS.md files. It shares the same filesystem — saved edits are " +
-      "visible and its edits are live, but unsaved reasoning and decisions are not. " +
-      "Concurrent subagents may finish in any order; do not assign overlapping file " +
-      "edits to concurrent subagents, as they can conflict. Do not wait, sleep, poll, " +
-      "or check on a spawned subagent. Continue with independent work or end your " +
-      "response; when the subagent finishes, its final text is delivered " +
-      "automatically as a new message that triggers a new turn.",
+      "Delegate an independent task to a fresh pi session in a new tmux window. " +
+      "The call returns immediately; do not wait or poll. The subagent sees the " +
+      "task and normal project context, including AGENTS.md, but not this " +
+      "conversation or prior tool results. It shares the working tree, so avoid " +
+      "concurrent tasks that edit the same files. Its result arrives as a new " +
+      "message that triggers a new turn.",
     parameters: Type.Object({
       task: Type.String({
         description:
-          "Write self-contained instructions for the subagent. It cannot see this " +
-          "conversation, so restate every conversation-specific detail it needs: " +
-          "the goal, prior findings or decisions, exact errors, constraints, and " +
-          "relevant file paths or symbols. Do not refer to 'the discussion above', " +
-          "'what we already tried', or other undeclared context. Pi automatically " +
-          "loads normal project context, including applicable AGENTS.md files, so " +
-          "do not repeat those instructions. Specify the expected output. The task " +
-          "is passed directly to the subagent as its initial prompt.",
+          "Self-contained instructions passed verbatim as the subagent's initial " +
+          "prompt. Include the goal, needed conversation-specific context, " +
+          "constraints, relevant paths or symbols, prior findings or errors, and " +
+          "the expected output. Do not reference context it cannot see or repeat " +
+          "project instructions from AGENTS.md.",
       }),
     }),
     execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
@@ -330,9 +324,8 @@ function setupParent(
             type: "text" as const,
             text:
               `Spawned subagent ${id} in ${toolCtx.cwd}. ` +
-              "Do not wait, sleep, poll, or check its status. Continue with " +
-              "independent work or end your response; its result will arrive " +
-              "automatically in a new turn.",
+              "Do not poll it; continue other work or end your response. Its " +
+              "result will arrive in a new turn.",
           },
         ],
       };
@@ -343,14 +336,14 @@ function setupParent(
 // ── child setup ─────────────────────────────────────────────────────
 
 const SUBAGENT_SYSTEM_PROMPT =
-  "You are a subagent spawned by a parent pi process. " +
-  "You do not share the parent's conversation, reasoning, or tool results. " +
-  "Follow the delegated task alongside the normal project context loaded by pi, " +
-  "including applicable AGENTS.md files. You run in the parent's working tree " +
-  "(the same filesystem), so your edits are live. " +
-  "Focus exclusively on the assigned task. " +
-  "When you are done, end your response with a clear summary. Only the text of " +
-  "your final message is sent back to the parent.";
+  "You are a subagent working on one task delegated by a parent pi session. " +
+  "The task prompt is your only parent-conversation context; also follow the " +
+  "project context loaded by pi. You share the parent's working tree, so your " +
+  "edits are immediately visible. Focus only on the delegated task. When it is " +
+  "complete, call complete_task with the result for the parent and make it your " +
+  "final tool call. Interactive replies and interruptions stay local and do not " +
+  "complete the task. If the user explicitly asks you to return current findings, " +
+  "call complete_task even if the task is incomplete.";
 
 async function setupChild(
   pi: ExtensionAPI,
@@ -393,99 +386,94 @@ async function setupChild(
     };
   });
 
-  // ── result capture and delivery (child → parent) ───────────────────
+  // ── terminal result delivery (child → parent) ──────────────────────
   //
-  // agent_end is a low-level run boundary: pi may still auto-retry,
-  // auto-compact and retry, or continue with queued steering/follow-up
-  // afterward. So we only CAPTURE the latest successful assistant result
-  // there and initiate delivery from agent_settled, which fires once pi has
-  // no automatic continuation left.
-  //
-  // `pendingSummary` holds the most recent assistant message with stopReason
-  // "stop"; any other terminus clears it, so an interrupted/failed run is
-  // never reported and leaves no stale earlier result.
-  //
-  // An interrupted run's next clean reply is an interactive answer, not the
-  // task completion summary. Suppress that reply once; a later clean run may
-  // still complete the task normally.
-  //
-  // `deliveryStarted` guarantees at most one socket send per session, even if
-  // several runs settle before the async flush/shutdown complete. The
-  // per-attempt `settled` below keeps the error/timeout/flush callbacks from
-  // double-finishing one attempt.
-  let pendingSummary: string | null = null;
-  let suppressNextReply = false;
-  let deliveryStarted = false;
+  // A successful local socket flush is the protocol's delivery boundary; the
+  // existing protocol has no application-level acknowledgement. A timeout or
+  // socket error can therefore be ambiguous. We let the model retry after any
+  // failed attempt: the parent's atomic task-file claim makes retransmission
+  // idempotent and guarantees that at most one result reaches the parent. Once
+  // an attempt flushes successfully, this child permanently rejects duplicates.
+  let completionState: "open" | "sending" | "complete" = "open";
 
-  pi.on("agent_end", (event) => {
-    const last = [...event.messages]
-      .reverse()
-      .find((m) => m.role === "assistant") as
-      | {
-          role: "assistant";
-          stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
-          content: { type: string; text?: string }[];
-        }
-      | undefined;
-
-    if (!last || last.stopReason !== "stop") {
-      if (last?.stopReason === "aborted") suppressNextReply = true;
-      pendingSummary = null;
-      return;
-    }
-    if (suppressNextReply) {
-      suppressNextReply = false;
-      pendingSummary = null;
-      return;
-    }
-    pendingSummary = last.content
-      .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map((c) => c.text)
-      .join("\n");
-  });
-
-  pi.on("agent_settled", (_event, ctx) => {
-    if (
-      deliveryStarted ||
-      pendingSummary === null ||
-      ctx.hasPendingMessages()
-    ) {
-      return;
-    }
-    deliveryStarted = true;
-
-    const payload = `${JSON.stringify({ id: subagentId, summary: pendingSummary })}\n`;
-
-    // Only a successful flush counts as delivery; otherwise we report the
-    // failure visibly and still shut down. `settled` prevents double-handling
-    // when several terminal events fire (e.g. error after timeout).
-    let settled = false;
-    const finish = (delivered: boolean) => {
-      if (settled) return;
-      settled = true;
-      if (!delivered) {
-        ctx.ui.notify(
-          "fork: could not deliver result to parent (socket unavailable); " +
-            "the result was not sent.",
-          "error",
+  pi.registerTool({
+    name: "complete_task",
+    label: "Complete Task",
+    description:
+      "Return the delegated task's result to the parent and end this child " +
+      "session. Use only when the task is complete or the user explicitly asks " +
+      "to return current findings; make this the final tool call. Interactive " +
+      "replies and progress updates stay local. If delivery fails, the task " +
+      "remains open; retry with the same result.",
+    parameters: Type.Object({
+      result: Type.String({
+        description:
+          "The complete result for the parent. Include the outcome and, when " +
+          "relevant, edits, verification, and blockers.",
+      }),
+    }),
+    execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
+      if (completionState !== "open") {
+        throw new Error(
+          completionState === "sending"
+            ? "complete_task is already delivering a result"
+            : "complete_task already completed this task",
         );
       }
-      ctx.shutdown();
-    };
+      completionState = "sending";
 
-    const socket = net.connect(socketPath);
-    socket.setTimeout(5000);
-    socket.on("error", (err) => {
-      console.error(`fork: failed to send result to parent: ${err}`);
-      socket.destroy();
-      finish(false);
-    });
-    socket.on("timeout", () => {
-      console.error("fork: timed out sending result to parent");
-      socket.destroy();
-      finish(false);
-    });
-    socket.end(payload, () => finish(true));
+      const { result } = params as { result: string };
+      const payload = `${JSON.stringify({ id: subagentId, summary: result })}\n`;
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          let settled = false;
+          const socket = net.connect(socketPath);
+          const finish = (err?: Error) => {
+            if (settled) return;
+            settled = true;
+            if (err) {
+              socket.destroy();
+              reject(err);
+            } else {
+              resolve();
+            }
+          };
+
+          socket.setTimeout(5000);
+          socket.once("error", (err) => finish(err));
+          socket.once("timeout", () =>
+            finish(new Error("timed out after 5 seconds")),
+          );
+          socket.end(payload, () => finish());
+        });
+      } catch (err) {
+        completionState = "open";
+        const message = `fork: could not deliver result to parent: ${err}`;
+        console.error(message);
+        toolCtx.ui.notify(
+          `${message}. The task remains open; retry complete_task with the same result.`,
+          "error",
+        );
+        throw new Error(
+          "Result delivery failed; the task remains open. Retry complete_task " +
+            "with the same result.",
+        );
+      }
+
+      completionState = "complete";
+      toolCtx.shutdown();
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "Result delivered to parent; closing this child session.",
+          },
+        ],
+        details: {},
+        terminate: true,
+      };
+    },
   });
 }
 
