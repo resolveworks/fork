@@ -69,6 +69,7 @@ const AGENTS_DIR = path.join(ROOT, "agents");
 const TASKS_DIR = path.join(ROOT, "tasks");
 const WORKTREES_DIR = path.join(ROOT, "worktrees");
 const BRANCH_PREFIX = "agent/";
+const BRANCH_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const RESULT_TYPE = "fork-result";
 const MESSAGE_TYPE = "fork-message";
 
@@ -193,12 +194,12 @@ async function createWorktree(
   branchName: string,
   signal?: AbortSignal,
 ): Promise<WorktreeInfo> {
-  const branch = `${BRANCH_PREFIX}${branchName}`;
-  try {
-    await git(pi, ["check-ref-format", "--branch", branch], cwd, signal);
-  } catch {
-    throw new Error(`fork: invalid agent branch name: ${branch}`);
+  if (!BRANCH_NAME.test(branchName)) {
+    throw new Error(
+      "fork: branch names must use lowercase letters, numbers, and single dashes",
+    );
   }
+  const branch = `${BRANCH_PREFIX}${branchName}`;
 
   // An explicit branch outside Git fails rather than degrading to shared mode.
   await git(pi, ["rev-parse", "--show-toplevel"], cwd, signal);
@@ -469,11 +470,12 @@ function setupParent(
       }),
       branch: Type.Optional(
         Type.String({
+          pattern: BRANCH_NAME.source,
           description:
-            "Name for a new isolated-worktree branch, without the agent/ prefix " +
-            "(for example, issue-4-worktree-isolation). Fork creates the exact " +
-            "branch agent/<name> from HEAD; it must be a valid Git branch name " +
-            "and must not already exist. Omit to share the current working tree.",
+            "Lowercase kebab-case name for a new isolated-worktree branch, " +
+            "without the agent/ prefix (for example, issue-4-worktree-isolation). " +
+            "Fork creates the exact branch agent/<name> from HEAD; it must not " +
+            "already exist. Omit to share the current working tree.",
         }),
       ),
     }),

@@ -31,7 +31,7 @@ If socket delivery fails or times out, the child displays an error and retries `
 
 ## Isolated worktrees
 
-Pass a descriptive branch suffix when delegating independent editing work:
+Pass a descriptive lowercase kebab-case branch suffix when delegating independent editing work:
 
 ```text
 spawn_agent({ task: "Implement issue #4", branch: "issue-4-worktrees" })
