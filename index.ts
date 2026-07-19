@@ -67,6 +67,8 @@ const ROOT = path.join(os.homedir(), ".pi", "agent", "extensions", "fork");
 const SOCKETS_DIR = path.join(ROOT, "sockets");
 const AGENTS_DIR = path.join(ROOT, "agents");
 const TASKS_DIR = path.join(ROOT, "tasks");
+const WORKTREES_DIR = path.join(ROOT, "worktrees");
+const BRANCH_PREFIX = "agent/";
 const RESULT_TYPE = "fork-result";
 const MESSAGE_TYPE = "fork-message";
 
@@ -80,6 +82,10 @@ function agentSocketPathFor(id: string): string {
 
 function taskPathFor(id: string): string {
   return path.join(TASKS_DIR, `${id}.md`);
+}
+
+function worktreePathFor(id: string): string {
+  return path.join(WORKTREES_DIR, id);
 }
 
 /** Exact lowercase format emitted by randomUUID(); also blocks path traversal. */
@@ -126,6 +132,96 @@ function loadConfig(cwd: string, projectTrusted: boolean): ForkConfig {
   return { ...globalCfg, ...projectCfg };
 }
 
+// ── git worktrees ───────────────────────────────────────────────────
+
+interface WorktreeInfo {
+  path: string;
+  branch: string;
+  repoCwd: string;
+}
+
+/** Run git without a shell. The generous timeout allows repository-owned
+ * post-checkout hooks to perform normal worktree setup. */
+async function git(
+  pi: ExtensionAPI,
+  args: string[],
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const result = await pi.exec("git", args, {
+    cwd,
+    signal,
+    timeout: 10 * 60 * 1000,
+  });
+  if (result.code !== 0 || result.killed) {
+    const detail = [result.stderr.trim(), result.stdout.trim()]
+      .filter(Boolean)
+      .join(" / ")
+      .slice(-4000);
+    const where = result.killed ? "killed" : `exit ${result.code}`;
+    throw new Error(
+      `fork: git ${args[0]} failed (${where})${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  return result.stdout;
+}
+
+/** Remove a worktree created by a failed spawn, then delete its new branch.
+ * Cleanup is best-effort so the original spawn error remains authoritative. */
+async function rollbackWorktree(
+  pi: ExtensionAPI,
+  info: WorktreeInfo,
+): Promise<void> {
+  try {
+    await git(pi, ["worktree", "remove", "--force", info.path], info.repoCwd);
+  } catch (err) {
+    console.error(`fork: could not roll back worktree ${info.path}: ${err}`);
+    return;
+  }
+
+  try {
+    await git(pi, ["branch", "-D", info.branch], info.repoCwd);
+  } catch (err) {
+    console.error(`fork: could not roll back branch ${info.branch}: ${err}`);
+  }
+}
+
+async function createWorktree(
+  pi: ExtensionAPI,
+  cwd: string,
+  id: string,
+  branchName: string,
+  signal?: AbortSignal,
+): Promise<WorktreeInfo> {
+  const branch = `${BRANCH_PREFIX}${branchName}`;
+  try {
+    await git(pi, ["check-ref-format", "--branch", branch], cwd, signal);
+  } catch {
+    throw new Error(`fork: invalid agent branch name: ${branch}`);
+  }
+
+  // An explicit branch outside Git fails rather than degrading to shared mode.
+  await git(pi, ["rev-parse", "--show-toplevel"], cwd, signal);
+  fs.mkdirSync(WORKTREES_DIR, { recursive: true });
+  const info = { path: worktreePathFor(id), branch, repoCwd: cwd };
+  try {
+    await git(
+      pi,
+      ["worktree", "add", "--quiet", "-b", branch, info.path, "HEAD"],
+      cwd,
+      signal,
+    );
+  } catch (err) {
+    // post-checkout can fail after creating both artifacts. Git rejects an
+    // existing branch before creating our path, so .git proves these are ours.
+    if (fs.existsSync(path.join(info.path, ".git"))) {
+      await rollbackWorktree(pi, info);
+    }
+    throw err;
+  }
+  return info;
+}
+
 // ── spawn (fire-and-forget) ─────────────────────────────────────────
 
 function spawn(
@@ -135,6 +231,7 @@ function spawn(
   taskPath: string,
   cwd: string,
   config: ForkConfig,
+  branch?: string,
 ): void {
   // argv passed directly; tmux runs a multi-arg command without `sh -c`, so
   // no shell quoting is needed. Let pi resolve model settings itself.
@@ -148,6 +245,7 @@ function spawn(
   if (config.provider) cmdArgs.push("--provider", config.provider);
   if (config.model) cmdArgs.push("--model", config.model);
   if (config.thinking) cmdArgs.push("--thinking", config.thinking);
+  if (branch) cmdArgs.push("--subagent-branch", branch);
   cmdArgs.push(`@${taskPath}`);
 
   tmuxSync([
@@ -351,14 +449,15 @@ function setupParent(
     label: "Spawn Agent",
     description:
       "Delegate a self-contained task to a subagent: a fresh pi session in a " +
-      "new tmux window, sharing your working tree. Use for independent work " +
-      "that benefits from isolated context; do simple, sequential, or " +
-      "context-dependent work yourself. The subagent sees the task plus " +
-      "normal project context (AGENTS.md, files), but not this conversation, " +
-      "so include needed context in the task. Avoid concurrent tasks that " +
-      "edit the same files. Returns immediately; the report arrives later as " +
-      "a message. Then request revisions with message_agent or close it with " +
-      "close_agent.",
+      "new tmux window. By default it shares your working tree; provide branch " +
+      "to create an isolated Git worktree on a new agent/<name> branch. Use " +
+      "for independent work that benefits from isolated context; do simple, " +
+      "sequential, or context-dependent work yourself. The subagent sees the " +
+      "task plus normal project context (AGENTS.md, files), but not this " +
+      "conversation, so include needed context in the task. Avoid concurrent " +
+      "editing agents in shared mode. Returns immediately; the report arrives " +
+      "later as a message. Then request revisions with message_agent or close " +
+      "it with close_agent.",
     parameters: Type.Object({
       task: Type.String({
         description:
@@ -368,26 +467,53 @@ function setupParent(
           "the expected output. Do not reference context it cannot see or repeat " +
           "project instructions from AGENTS.md.",
       }),
+      branch: Type.Optional(
+        Type.String({
+          description:
+            "Name for a new isolated-worktree branch, without the agent/ prefix " +
+            "(for example, issue-4-worktree-isolation). Fork creates the exact " +
+            "branch agent/<name> from HEAD; it must be a valid Git branch name " +
+            "and must not already exist. Omit to share the current working tree.",
+        }),
+      ),
     }),
-    execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
-      const { task } = params as { task: string };
+    execute: async (_id, params, signal, _onUpdate, toolCtx) => {
+      const { task, branch } = params as { task: string; branch?: string };
       const id = randomUUID();
       const taskPath = taskPathFor(id);
       fs.writeFileSync(taskPath, task, { mode: 0o600 });
+
+      let worktree: WorktreeInfo | undefined;
       try {
         const config = loadConfig(toolCtx.cwd, toolCtx.isProjectTrusted());
-        spawn(session, sessionId, id, taskPath, toolCtx.cwd, config);
+        if (branch !== undefined) {
+          worktree = await createWorktree(pi, toolCtx.cwd, id, branch, signal);
+        }
+        spawn(
+          session,
+          sessionId,
+          id,
+          taskPath,
+          worktree?.path ?? toolCtx.cwd,
+          config,
+          worktree?.branch,
+        );
       } catch (err) {
+        if (worktree) await rollbackWorktree(pi, worktree);
         // Roll back exactly this id's task file so pi reports the spawn error.
         safeUnlink(taskPath, `task file for ${id}`);
         throw err;
       }
+
+      const location = worktree
+        ? `${worktree.path} on branch ${worktree.branch}`
+        : toolCtx.cwd;
       return {
         content: [
           {
             type: "text" as const,
             text:
-              `Spawned subagent ${id} in ${toolCtx.cwd}. ` +
+              `Spawned subagent ${id} in ${location}. ` +
               "Do not poll it; continue other work or end your response. Its " +
               "report will arrive in a new turn, after which it stays alive " +
               "awaiting your verdict.",
@@ -446,8 +572,10 @@ function setupParent(
     label: "Close Agent",
     description:
       "Shut down a live subagent's session without spending a model turn. " +
-      "Use to accept its report or to stop one you no longer need. Subagents " +
-      "stay alive until closed; close every subagent when you are done with it.",
+      "Use to accept its report or to stop one you no longer need. For an " +
+      "isolated agent, this removes its worktree but retains its agent/<name> " +
+      "branch for normal review, merge, or deletion. Subagents stay alive " +
+      "until closed; close every subagent when you are done with it.",
     parameters: Type.Object({
       id: Type.String({
         description: "The subagent's UUID, from its spawn result or report.",
@@ -456,21 +584,46 @@ function setupParent(
     execute: async (_toolId, params) => {
       const { id } = params as { id: string };
       assertOpenAgent(id);
+      const worktreePath = worktreePathFor(id);
+      const hasWorktree = fs.existsSync(path.join(worktreePath, ".git"));
+
       try {
         await sendToAgent(id, { type: "close" });
       } catch (err) {
+        const cleanup = hasWorktree
+          ? `remove worktree ${worktreePath} with git worktree remove --force ` +
+            "and remove its task file manually; its branch will be retained"
+          : "remove its task file manually";
         throw new Error(
           `Could not reach subagent ${id}: ${err}. It may still be starting ` +
-            "(retry shortly); if its tmux window is already gone, clean up " +
-            "its task file manually.",
+            `(retry shortly); if its tmux window is already gone, ${cleanup}.`,
         );
       }
+
+      let cleanupWarning = "";
+      if (hasWorktree) {
+        try {
+          await git(
+            pi,
+            ["worktree", "remove", "--force", worktreePath],
+            worktreePath,
+          );
+        } catch (err) {
+          cleanupWarning = ` Worktree cleanup failed: ${err}. Remove ${worktreePath} manually.`;
+          console.error(`fork:${cleanupWarning}`);
+        }
+      }
+
       safeUnlink(taskPathFor(id), `task file for ${id}`);
+      const retained = hasWorktree ? " Its branch was retained." : "";
       return {
         content: [
           {
             type: "text" as const,
-            text: `Subagent ${id} received the close message and is shutting down.`,
+            text:
+              `Subagent ${id} received the close message and is shutting down.` +
+              retained +
+              cleanupWarning,
           },
         ],
         details: {},
@@ -481,17 +634,27 @@ function setupParent(
 
 // ── child setup ─────────────────────────────────────────────────────
 
-const SUBAGENT_SYSTEM_PROMPT =
-  "You are a subagent executing one task delegated by a parent pi session. " +
-  "You see the task prompt and pi's normal project context, but not the " +
-  "parent's conversation. You share the parent's working tree, so your edits " +
-  "are immediately visible. Focus only on the delegated task. Report with " +
-  "report_result when you believe it is done, then end your turn and wait: " +
-  "the session stays alive while the parent reviews. The parent may send " +
-  "revision requests as ordinary messages — act on them and report again — " +
-  "and closes the session when the work is accepted. Only report_result " +
-  "reaches the parent; interactive replies stay local. If the user asks for " +
-  "current findings, call report_result even when the task is incomplete.";
+function subagentSystemPrompt(branch?: string): string {
+  const workspace = branch
+    ? `You work in an isolated Git worktree on branch ${branch}. For code ` +
+      "changes, commit all work before reporting so the parent can review and " +
+      "merge the branch; repository commit hooks provide its validation. "
+    : "You share the parent's working tree, so your edits are immediately visible. ";
+
+  return (
+    "You are a subagent executing one task delegated by a parent pi session. " +
+    "You see the task prompt and pi's normal project context, but not the " +
+    "parent's conversation. " +
+    workspace +
+    "Focus only on the delegated task. Report with report_result when you " +
+    "believe it is done, then end your turn and wait: the session stays alive " +
+    "while the parent reviews. The parent may send revision requests as " +
+    "ordinary messages — act on them and report again — and closes the session " +
+    "when the work is accepted. Only report_result reaches the parent; " +
+    "interactive replies stay local. If the user asks for current findings, " +
+    "call report_result even when the task is incomplete."
+  );
+}
 
 /**
  * Parse and act on one newline-delimited parent message. Malformed JSON or
@@ -544,10 +707,11 @@ function setupChild(
   ctx: { shutdown: () => void },
   socketPath: string,
   subagentId: string,
+  branch?: string,
 ): void {
   pi.on("before_agent_start", (event) => {
     return {
-      systemPrompt: `${event.systemPrompt}\n\n${SUBAGENT_SYSTEM_PROMPT}`,
+      systemPrompt: `${event.systemPrompt}\n\n${subagentSystemPrompt(branch)}`,
     };
   });
 
@@ -658,6 +822,11 @@ export default function (pi: ExtensionAPI) {
     type: "string",
   });
 
+  pi.registerFlag("subagent-branch", {
+    description: "Isolated worktree branch (internal)",
+    type: "string",
+  });
+
   pi.on("session_start", (_event, ctx) => {
     const socketPath = pi.getFlag("subagent-socket") as string | undefined;
 
@@ -669,6 +838,7 @@ export default function (pi: ExtensionAPI) {
 
     // Child mode
     const subagentId = pi.getFlag("subagent-id") as string;
-    setupChild(pi, ctx, socketPath, subagentId);
+    const branch = pi.getFlag("subagent-branch") as string | undefined;
+    setupChild(pi, ctx, socketPath, subagentId, branch);
   });
 }
