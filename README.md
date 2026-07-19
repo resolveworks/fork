@@ -1,46 +1,55 @@
 # fork
 
-A [pi](https://github.com/earendil-works/pi) extension that spawns subagents as separate pi sessions in tmux windows.
-
-## Requirements
-
-- tmux
-- Run pi inside tmux
+Spawn [pi](https://github.com/earendil-works/pi) subagents in tmux windows. Written for my own use; it assumes fluency with pi, tmux, and git worktrees, and stays out of the way — including silently doing nothing outside tmux.
 
 ## Install
 
 ```bash
-pi install git:github.com/johan/fork
+pi install git:github.com/resolveworks/fork
 ```
 
-Or try without installing:
+Or once, without installing:
 
 ```bash
-pi -e git:github.com/johan/fork
+pi -e git:github.com/resolveworks/fork
 ```
 
-## How it works
+## What you get
 
-The parent LLM gets **spawn_agent**, **message_agent**, and **close_agent** tools. Calling `spawn_agent` opens a new tmux window running pi with the given task and returns immediately. By default the child shares the parent's working tree. Supplying `branch` creates a new `agent/<name>` branch in an isolated Git worktree instead.
+The parent session gains three tools:
 
-When the child believes its delegated task is complete, it calls **report_result** with a report for the parent. That payload is sent over a Unix socket and delivered as a notification that triggers a new parent turn — and the child stays alive awaiting the verdict. The parent reviews the report, requests revisions with **message_agent** (delivered as an ordinary turn in the child, which reports again), and closes the child with **close_agent** when the work is accepted.
+- `spawn_agent({ task, branch? })` — writes the task to a file and opens a new tmux window running `pi @<taskfile>`. Returns immediately. The child sees the task plus normal project context, not the parent's conversation, so the task must be self-contained.
+- `message_agent({ id, text })` — delivers a revision request as an ordinary follow-up turn in the child.
+- `close_agent({ id })` — mechanical shutdown; no model turn spent.
 
-`report_result` is not a progress-reporting tool and ordinary interactive answers in the child remain local. Interrupting a child has no reporting semantics; the child should report only when it believes its delegated task is done or when the user explicitly asks it to return its current findings.
+The child gains `report_result({ result })`. The report travels over a Unix socket and arrives in the parent as a notification that triggers a new turn. The child stays alive after reporting, awaiting the verdict: revisions via `message_agent`, or closure. Reports are outcomes, not progress updates. If delivery fails, the child is told unambiguously and retries with the same payload — a retry cannot double-deliver.
 
-If socket delivery fails or times out, the child displays an error and retries `report_result` with the same result. Delivery failures are unambiguous in practice, so a retry cannot deliver a report twice.
+Don't poll. Navigate windows with your usual tmux keys.
 
-## Isolated worktrees
+## Isolation
 
-Pass a descriptive lowercase kebab-case branch suffix when delegating independent editing work:
+Without `branch`, the child shares the parent's working tree — fine for read-only or sequential work, a bad idea for concurrent editors.
 
-```text
-spawn_agent({ task: "Implement issue #4", branch: "issue-4-worktrees" })
+With `branch: "kebab-name"`, fork runs `git worktree add ~/.pi/worktrees/<uuid> -b agent/<kebab-name> HEAD` and spawns the child there. The child commits its work; `close_agent` force-removes the worktree (uncommitted work dies with it) and retains the branch for normal review and merge.
+
+Fork deliberately does no environment setup and runs no checks. `git worktree add` fires the repo's `post-checkout` hook — put pnpm/uv/whatever setup there. Commit hooks validate.
+
+## Config
+
+`~/.pi/agent/fork.json`, overridden per-project by `.pi/fork.json` (read only in trusted projects). All fields optional; passed through to the child as CLI flags:
+
+```json
+{ "model": "glm-5.2", "provider": "zai", "thinking": "high" }
 ```
 
-Fork creates `agent/issue-4-worktrees` from the current `HEAD` and starts the child under `~/.pi/worktrees/<id>`. The child commits its changes so the parent can review and merge the branch normally. `close_agent` removes the worktree, discards any uncommitted changes, and retains the branch for merge or deletion.
+## Runtime state
 
-Fork does not install dependencies, copy environment files, or run checks. Git invokes the repository's `post-checkout` hook during `git worktree add`; repositories can perform their normal pnpm, uv, or other setup there. Commit hooks remain responsible for validation.
+Under `~/.pi/agent/extensions/fork/` (sockets and task files are mode `0o600`):
 
-If a parent exits with children still alive, their tmux windows and isolated worktrees linger. Kill the windows, remove isolated worktrees with `git worktree remove`, and remove their task files under `~/.pi/agent/extensions/fork/tasks/` by hand. Agent branches are retained.
+- `sockets/<parent-session-id>.sock` — result channel, child → parent
+- `agents/<uuid>.sock` — verdict channel, parent → child
+- `tasks/<uuid>.md` — the task handed to the child; a present task file marks an open agent and is authoritative across extension reloads
 
-Use tmux keybindings (`Ctrl+B n/p/1-9`, etc.) to navigate between windows.
+## Orphans
+
+None handled. If a parent dies with children alive: kill their tmux windows, `git worktree remove` any worktrees under `~/.pi/worktrees/`, delete their task files. Agent branches are always retained, whatever happens.
