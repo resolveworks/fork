@@ -63,11 +63,12 @@ function tmuxSession(): string {
 
 // ── paths ───────────────────────────────────────────────────────────
 
-const ROOT = path.join(os.homedir(), ".pi", "agent", "extensions", "fork");
+const PI_DIR = path.join(os.homedir(), ".pi");
+const ROOT = path.join(PI_DIR, "agent", "extensions", "fork");
 const SOCKETS_DIR = path.join(ROOT, "sockets");
 const AGENTS_DIR = path.join(ROOT, "agents");
 const TASKS_DIR = path.join(ROOT, "tasks");
-const WORKTREES_DIR = path.join(ROOT, "worktrees");
+const WORKTREES_DIR = path.join(PI_DIR, "worktrees");
 const BRANCH_PREFIX = "agent/";
 const BRANCH_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const RESULT_TYPE = "fork-result";

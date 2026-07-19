@@ -37,7 +37,7 @@ Pass a descriptive lowercase kebab-case branch suffix when delegating independen
 spawn_agent({ task: "Implement issue #4", branch: "issue-4-worktrees" })
 ```
 
-Fork creates `agent/issue-4-worktrees` from the current `HEAD` and starts the child under `~/.pi/agent/extensions/fork/worktrees/<id>`. The child commits its changes so the parent can review and merge the branch normally. `close_agent` removes the worktree, discards any uncommitted changes, and retains the branch for merge or deletion.
+Fork creates `agent/issue-4-worktrees` from the current `HEAD` and starts the child under `~/.pi/worktrees/<id>`. The child commits its changes so the parent can review and merge the branch normally. `close_agent` removes the worktree, discards any uncommitted changes, and retains the branch for merge or deletion.
 
 Fork does not install dependencies, copy environment files, or run checks. Git invokes the repository's `post-checkout` hook during `git worktree add`; repositories can perform their normal pnpm, uv, or other setup there. Commit hooks remain responsible for validation.
 

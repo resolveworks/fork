@@ -13,6 +13,6 @@ Everything lives in `index.ts` — start at the default export.
   - `sockets/` — per-parent Unix sockets, mode `0o600`
   - `agents/` — per-child Unix sockets (verdict channel), mode `0o600`
   - `tasks/` — per-id task files handed to children at spawn via pi's `@<path>` argument, mode `0o600`; a present task file marks an open agent and persists until `close_agent`
-  - `worktrees/` — per-isolated-child linked Git worktrees; paths use the child UUID while branches use the requested `agent/<name>`
+- **Worktrees** live under `~/.pi/worktrees/<id>`; paths use the child UUID while branches use the requested `agent/<name>`
 - **Repository policy:** fork only creates and removes worktrees. Repository-owned `post-checkout` and commit hooks handle environment setup and validation; fork has no setup runner or checks gate.
 - **Orphan policy:** none. If a parent exits with children alive, their tmux windows and worktrees linger; kill the windows, run `git worktree remove` for isolated children, and remove their task files by hand. Agent branches are always retained for ordinary merge or deletion.
