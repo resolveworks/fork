@@ -1,11 +1,13 @@
 /**
  * fork — Spawn pi subagents in separate tmux windows.
  *
- * The parent registers a single `spawn` tool. Calling it opens a new
- * tmux window running pi with the given task and returns immediately.
- * When the child completes its task, it explicitly sends its result through
- * a terminal tool. The result is delivered over a Unix socket as a
- * notification that triggers a new parent turn.
+ * The parent registers `spawn_agent`, `message_agent`, and `close_agent`
+ * tools. Calling spawn_agent opens a new tmux window running pi with the
+ * given task and returns immediately. The child reports results through `report_result`;
+ * each report is delivered over a Unix socket as a notification that triggers
+ * a new parent turn. The child stays alive after reporting: the parent
+ * reviews the report, sends revision requests with message_agent, and closes
+ * the child with close_agent.
  *
  * Configure the subagent model via ~/.pi/agent/fork.json (global) or
  * .pi/fork.json (project, overrides global). Any field is optional:
@@ -63,11 +65,17 @@ function tmuxSession(): string {
 
 const ROOT = path.join(os.homedir(), ".pi", "agent", "extensions", "fork");
 const SOCKETS_DIR = path.join(ROOT, "sockets");
+const AGENTS_DIR = path.join(ROOT, "agents");
 const TASKS_DIR = path.join(ROOT, "tasks");
 const RESULT_TYPE = "fork-result";
+const MESSAGE_TYPE = "fork-message";
 
 function socketPathFor(sessionId: string): string {
   return path.join(SOCKETS_DIR, `${sessionId}.sock`);
+}
+
+function agentSocketPathFor(id: string): string {
+  return path.join(AGENTS_DIR, `${id}.sock`);
 }
 
 function taskPathFor(id: string): string {
@@ -78,12 +86,16 @@ function taskPathFor(id: string): string {
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-// ── result payload (child → parent over socket) ─────────────────────
+// ── wire protocol (newline-delimited JSON) ──────────────────────────
 
+/** Child → parent, over the parent's session socket. */
 interface ResultPayload {
   id: string;
   summary: string;
 }
+
+/** Parent → child, over the child's agent socket. */
+type AgentMessage = { type: "message"; text: string } | { type: "close" };
 
 // ── config (~/.pi/agent/fork.json, .pi/fork.json) ───────────────────
 
@@ -150,19 +162,7 @@ function spawn(
   ]);
 }
 
-// ── result delivery ─────────────────────────────────────────────────
-
-function deliverResult(pi: ExtensionAPI, payload: ResultPayload): void {
-  const summary = payload.summary.trim() || "(no output)";
-  pi.sendMessage(
-    {
-      customType: RESULT_TYPE,
-      content: `Subagent ${payload.id} finished:\n\n${summary}`,
-      display: true,
-    },
-    { triggerTurn: true },
-  );
-}
+// ── line servers and socket writes ──────────────────────────────────
 
 /** Remove a file, tolerating an already-missing path. Never throws —
  * callers (spawn rollback, socket teardown) must keep working. */
@@ -176,10 +176,104 @@ function safeUnlink(filePath: string, what: string): void {
 }
 
 /**
+ * Listen on sockPath and invoke onLine per newline-delimited payload. A
+ * stale socket file from a previous run is removed first. Server errors
+ * (e.g. unable to bind) are logged, not thrown: the session keeps running
+ * and the peer reports connection failures on its side. Mode 0o600 is
+ * enforced once listening starts.
+ */
+function serveLines(
+  sockPath: string,
+  what: string,
+  onLine: (line: string) => void,
+): net.Server {
+  safeUnlink(sockPath, `stale ${what}`);
+  const server = net.createServer((socket) => {
+    let buf = "";
+    socket.setEncoding("utf-8");
+    socket.on("error", (err) => {
+      console.error(`fork: ${what} connection error: ${err}`);
+    });
+    socket.on("data", (chunk: string) => {
+      buf += chunk;
+      for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (line.length === 0) continue;
+        onLine(line);
+      }
+    });
+  });
+  server.on("error", (err) => {
+    console.error(`fork: ${what} error: ${err}`);
+  });
+  server.listen(sockPath, () => {
+    try {
+      fs.chmodSync(sockPath, 0o600);
+    } catch (err) {
+      console.error(`fork: could not chmod ${what} ${sockPath}: ${err}`);
+    }
+  });
+  return server;
+}
+
+function teardownServer(server: net.Server, sockPath: string, what: string) {
+  // close() with a callback absorbs ERR_SERVER_NOT_RUNNING instead of
+  // emitting an unhandled 'error'.
+  server.close((err) => {
+    if (
+      err &&
+      (err as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING"
+    ) {
+      console.error(`fork: error closing ${what}: ${err}`);
+    }
+  });
+  safeUnlink(sockPath, what);
+}
+
+/** Deliver one message to a live agent. Throws when the agent is unreachable
+ * or the write does not flush; callers report failure and keep their state. */
+function sendToAgent(id: string, message: AgentMessage): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const socket = net.connect(agentSocketPathFor(id));
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (err) {
+        socket.destroy();
+        reject(err);
+      } else {
+        resolve();
+      }
+    };
+    socket.setTimeout(5000);
+    socket.once("error", (err) => finish(err));
+    socket.once("timeout", () =>
+      finish(new Error("timed out after 5 seconds")),
+    );
+    socket.end(`${JSON.stringify(message)}\n`, () => finish());
+  });
+}
+
+// ── result delivery ─────────────────────────────────────────────────
+
+function deliverResult(pi: ExtensionAPI, payload: ResultPayload): void {
+  const summary = payload.summary.trim() || "(no output)";
+  pi.sendMessage(
+    {
+      customType: RESULT_TYPE,
+      content: `Subagent ${payload.id} reported:\n\n${summary}`,
+      display: true,
+    },
+    { triggerTurn: true },
+  );
+}
+
+/**
  * Parse and act on one newline-delimited result line. Malformed JSON or shape
  * is logged and ignored without aborting the handler or dropping later lines.
- * Removing the validated id's task file atomically claims the result, so only
- * the first result for a pending task is delivered.
+ * A result is delivered only while its agent is still open (task file present).
  */
 function processResultLine(pi: ExtensionAPI, line: string): void {
   let parsed: unknown;
@@ -204,7 +298,7 @@ function processResultLine(pi: ExtensionAPI, line: string): void {
     return;
   }
 
-  const id = candidate.id;
+  const { id, summary } = candidate as ResultPayload;
   if (!UUID_V4.test(id)) {
     console.error(
       `fork: ignoring result with invalid subagent id (not a UUID v4): ${id}`,
@@ -212,24 +306,25 @@ function processResultLine(pi: ExtensionAPI, line: string): void {
     return;
   }
 
-  // Unlink is both the pending check and atomic claim; do not check existence first.
-  try {
-    fs.unlinkSync(taskPathFor(id));
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      console.error(
-        `fork: ignoring result for unknown or already-delivered id ${id}`,
-      );
-    } else {
-      console.error(`fork: could not claim task file for ${id}: ${err}`);
-    }
+  if (!fs.existsSync(taskPathFor(id))) {
+    console.error(`fork: ignoring result for unknown or closed id ${id}`);
     return;
   }
 
-  deliverResult(pi, { id, summary: candidate.summary });
+  deliverResult(pi, { id, summary });
 }
 
 // ── parent setup ────────────────────────────────────────────────────
+
+/** Validate an agent id and that the agent is still open (task file present). */
+function assertOpenAgent(id: string): void {
+  if (!UUID_V4.test(id)) {
+    throw new Error(`Invalid subagent id (not a UUID v4): ${id}`);
+  }
+  if (!fs.existsSync(taskPathFor(id))) {
+    throw new Error(`Unknown or already closed subagent ${id}`);
+  }
+}
 
 function setupParent(
   pi: ExtensionAPI,
@@ -242,62 +337,28 @@ function setupParent(
   const sessionId = ctx.sessionManager.getSessionId();
   const sockPath = socketPathFor(sessionId);
 
-  // Remove a stale socket left by a previous (crashed/killed) run.
-  safeUnlink(sockPath, "stale socket");
-
   // Task files are authoritative, so running children survive extension reloads.
-  const server = net.createServer((socket) => {
-    let buf = "";
-    socket.setEncoding("utf-8");
-    socket.on("error", (err) => {
-      console.error(`fork: result socket connection error: ${err}`);
-    });
-    socket.on("data", (chunk: string) => {
-      buf += chunk;
-      for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
-        const line = buf.slice(0, nl);
-        buf = buf.slice(nl + 1);
-        if (line.length === 0) continue;
-        processResultLine(pi, line);
-      }
-    });
-  });
-
-  // A server 'error' (e.g. unable to bind) is logged, not thrown: the parent
-  // keeps running; children fail to connect and report that themselves.
-  // Mode 0o600 is enforced once listening starts.
-  server.on("error", (err) => {
-    console.error(`fork: result socket error: ${err}`);
-  });
-  server.listen(sockPath, () => {
-    try {
-      fs.chmodSync(sockPath, 0o600);
-    } catch (err) {
-      console.error(`fork: could not chmod socket ${sockPath}: ${err}`);
-    }
-  });
+  const server = serveLines(sockPath, "result socket", (line) =>
+    processResultLine(pi, line),
+  );
 
   pi.on("session_shutdown", () => {
-    // close() with a callback absorbs ERR_SERVER_NOT_RUNNING instead of
-    // emitting an unhandled 'error'.
-    server.close((err) => {
-      if (err && err.code !== "ERR_SERVER_NOT_RUNNING") {
-        console.error(`fork: error closing result socket server: ${err}`);
-      }
-    });
-    safeUnlink(sockPath, "result socket");
+    teardownServer(server, sockPath, "result socket");
   });
 
   pi.registerTool({
-    name: "spawn",
-    label: "Spawn",
+    name: "spawn_agent",
+    label: "Spawn Agent",
     description:
-      "Delegate an independent task to a fresh pi session in a new tmux window. " +
-      "The call returns immediately; do not wait or poll. The subagent sees the " +
-      "task and normal project context, including AGENTS.md, but not this " +
-      "conversation or prior tool results. It shares the working tree, so avoid " +
-      "concurrent tasks that edit the same files. Its result arrives as a new " +
-      "message that triggers a new turn.",
+      "Delegate a self-contained task to a subagent: a fresh pi session in a " +
+      "new tmux window, sharing your working tree. Use for independent work " +
+      "that benefits from isolated context; do simple, sequential, or " +
+      "context-dependent work yourself. The subagent sees the task plus " +
+      "normal project context (AGENTS.md, files), but not this conversation, " +
+      "so include needed context in the task. Avoid concurrent tasks that " +
+      "edit the same files. Returns immediately; the report arrives later as " +
+      "a message. Then request revisions with message_agent or close it with " +
+      "close_agent.",
     parameters: Type.Object({
       task: Type.String({
         description:
@@ -328,9 +389,91 @@ function setupParent(
             text:
               `Spawned subagent ${id} in ${toolCtx.cwd}. ` +
               "Do not poll it; continue other work or end your response. Its " +
-              "result will arrive in a new turn.",
+              "report will arrive in a new turn, after which it stays alive " +
+              "awaiting your verdict.",
           },
         ],
+        details: {},
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "message_agent",
+    label: "Message Agent",
+    description:
+      "Send a revision request or follow-up instruction to a live subagent. " +
+      "It receives your text as a new turn, acts on it, and reports again. " +
+      "Use after reviewing its report when changes are needed; use " +
+      "close_agent when the work is accepted. The next report arrives as a " +
+      "message — do not poll.",
+    parameters: Type.Object({
+      id: Type.String({
+        description: "The subagent's UUID, from its spawn result or report.",
+      }),
+      text: Type.String({
+        description: "The feedback or instruction for the subagent.",
+      }),
+    }),
+    execute: async (_toolId, params) => {
+      const { id, text } = params as { id: string; text: string };
+      assertOpenAgent(id);
+      try {
+        await sendToAgent(id, { type: "message", text });
+      } catch (err) {
+        throw new Error(
+          `Could not reach subagent ${id}: ${err}. It may still be starting ` +
+            "(retry shortly) or may have exited; if it stays unreachable, " +
+            "clean up its tmux window and task file manually.",
+        );
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Message delivered to subagent ${id}. It will act on it and may ` +
+              "report again; do not poll.",
+          },
+        ],
+        details: {},
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "close_agent",
+    label: "Close Agent",
+    description:
+      "Shut down a live subagent's session without spending a model turn. " +
+      "Use to accept its report or to stop one you no longer need. Subagents " +
+      "stay alive until closed; close every subagent when you are done with it.",
+    parameters: Type.Object({
+      id: Type.String({
+        description: "The subagent's UUID, from its spawn result or report.",
+      }),
+    }),
+    execute: async (_toolId, params) => {
+      const { id } = params as { id: string };
+      assertOpenAgent(id);
+      try {
+        await sendToAgent(id, { type: "close" });
+      } catch (err) {
+        throw new Error(
+          `Could not reach subagent ${id}: ${err}. It may still be starting ` +
+            "(retry shortly); if its tmux window is already gone, clean up " +
+            "its task file manually.",
+        );
+      }
+      safeUnlink(taskPathFor(id), `task file for ${id}`);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Subagent ${id} received the close message and is shutting down.`,
+          },
+        ],
+        details: {},
       };
     },
   });
@@ -339,17 +482,66 @@ function setupParent(
 // ── child setup ─────────────────────────────────────────────────────
 
 const SUBAGENT_SYSTEM_PROMPT =
-  "You are a subagent working on one task delegated by a parent pi session. " +
-  "The task prompt is your only parent-conversation context; also follow the " +
-  "project context loaded by pi. You share the parent's working tree, so your " +
-  "edits are immediately visible. Focus only on the delegated task. When it is " +
-  "complete, call complete_task with the result for the parent and make it your " +
-  "final tool call. Interactive replies and interruptions stay local and do not " +
-  "complete the task. If the user explicitly asks you to return current findings, " +
-  "call complete_task even if the task is incomplete.";
+  "You are a subagent executing one task delegated by a parent pi session. " +
+  "You see the task prompt and pi's normal project context, but not the " +
+  "parent's conversation. You share the parent's working tree, so your edits " +
+  "are immediately visible. Focus only on the delegated task. Report with " +
+  "report_result when you believe it is done, then end your turn and wait: " +
+  "the session stays alive while the parent reviews. The parent may send " +
+  "revision requests as ordinary messages — act on them and report again — " +
+  "and closes the session when the work is accepted. Only report_result " +
+  "reaches the parent; interactive replies stay local. If the user asks for " +
+  "current findings, call report_result even when the task is incomplete.";
+
+/**
+ * Parse and act on one newline-delimited parent message. Malformed JSON or
+ * shape is logged and ignored without aborting the handler or dropping later
+ * lines.
+ */
+function processAgentLine(
+  pi: ExtensionAPI,
+  ctx: { shutdown: () => void },
+  line: string,
+): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch (err) {
+    console.error(`fork: ignoring malformed agent line (invalid JSON): ${err}`);
+    return;
+  }
+
+  if (typeof parsed !== "object" || parsed === null) {
+    console.error(`fork: ignoring malformed agent message: ${line}`);
+    return;
+  }
+  const candidate = parsed as { type?: unknown; text?: unknown };
+
+  if (candidate.type === "message" && typeof candidate.text === "string") {
+    // followUp: let a busy child finish its current work before the verdict.
+    pi.sendMessage(
+      {
+        customType: MESSAGE_TYPE,
+        content: `Message from parent:\n\n${candidate.text}`,
+        display: true,
+      },
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
+    return;
+  }
+
+  if (candidate.type === "close") {
+    // Approval: shut down mechanically, no model turn spent on it.
+    ctx.shutdown();
+    return;
+  }
+
+  console.error(`fork: ignoring malformed agent message: ${line}`);
+}
 
 function setupChild(
   pi: ExtensionAPI,
+  ctx: { shutdown: () => void },
   socketPath: string,
   subagentId: string,
 ): void {
@@ -359,25 +551,20 @@ function setupChild(
     };
   });
 
-  // ── terminal result delivery (child → parent) ──────────────────────
+  // ── result reporting (child → parent) ──────────────────────────────
   //
-  // A successful local socket flush is the protocol's delivery boundary; the
-  // existing protocol has no application-level acknowledgement. A timeout or
-  // socket error can therefore be ambiguous. We let the model retry after any
-  // failed attempt: the parent's atomic task-file claim makes retransmission
-  // idempotent and guarantees that at most one result reaches the parent. Once
-  // an attempt flushes successfully, this child permanently rejects duplicates.
-  let completionState: "open" | "sending" | "complete" = "open";
+  // Delivery failures are reported to the model, which retries with the same
+  // result. Failures are unambiguous in practice: they mean the parent is
+  // gone or the write failed, so a retry cannot deliver a report twice.
+  let reportState: "open" | "sending" = "open";
 
   pi.registerTool({
-    name: "complete_task",
-    label: "Complete Task",
+    name: "report_result",
+    label: "Report Result",
     description:
-      "Return the delegated task's result to the parent and end this child " +
-      "session. Use only when the task is complete or the user explicitly asks " +
-      "to return current findings; make this the final tool call. Interactive " +
-      "replies and progress updates stay local. If delivery fails, the task " +
-      "remains open; retry with the same result.",
+      "Send a result report to the parent. Use when the task is done, when " +
+      "reporting a requested revision, or when the user asks for current " +
+      "findings. Report outcomes, not progress updates.",
     parameters: Type.Object({
       result: Type.String({
         description:
@@ -386,14 +573,10 @@ function setupChild(
       }),
     }),
     execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
-      if (completionState !== "open") {
-        throw new Error(
-          completionState === "sending"
-            ? "complete_task is already delivering a result"
-            : "complete_task already completed this task",
-        );
+      if (reportState !== "open") {
+        throw new Error("report_result is already delivering a report");
       }
-      completionState = "sending";
+      reportState = "sending";
 
       const { result } = params as { result: string };
       const payload = `${JSON.stringify({ id: subagentId, summary: result })}\n`;
@@ -421,32 +604,42 @@ function setupChild(
           socket.end(payload, () => finish());
         });
       } catch (err) {
-        completionState = "open";
+        reportState = "open";
         const message = `fork: could not deliver result to parent: ${err}`;
         console.error(message);
         toolCtx.ui.notify(
-          `${message}. The task remains open; retry complete_task with the same result.`,
+          `${message}. The report was not sent; retry report_result with the same result.`,
           "error",
         );
         throw new Error(
-          "Result delivery failed; the task remains open. Retry complete_task " +
-            "with the same result.",
+          "Result delivery failed; the report was not sent. Retry " +
+            "report_result with the same result.",
         );
       }
 
-      completionState = "complete";
-      toolCtx.shutdown();
+      reportState = "open";
       return {
         content: [
           {
             type: "text" as const,
-            text: "Result delivered to parent; closing this child session.",
+            text: "Report delivered. End your turn and await the parent's verdict.",
           },
         ],
         details: {},
-        terminate: true,
       };
     },
+  });
+
+  // ── verdict channel (parent → child) ─────────────────────────────────
+
+  fs.mkdirSync(AGENTS_DIR, { recursive: true });
+  const agentSockPath = agentSocketPathFor(subagentId);
+  const server = serveLines(agentSockPath, "agent socket", (line) =>
+    processAgentLine(pi, ctx, line),
+  );
+
+  pi.on("session_shutdown", () => {
+    teardownServer(server, agentSockPath, "agent socket");
   });
 }
 
@@ -476,6 +669,6 @@ export default function (pi: ExtensionAPI) {
 
     // Child mode
     const subagentId = pi.getFlag("subagent-id") as string;
-    setupChild(pi, socketPath, subagentId);
+    setupChild(pi, ctx, socketPath, subagentId);
   });
 }
