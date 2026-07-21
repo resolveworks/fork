@@ -541,7 +541,10 @@ function setupParent(
         description: "The subagent's UUID, from its spawn result or report.",
       }),
       text: Type.String({
-        description: "The feedback or instruction for the subagent.",
+        description:
+          "The feedback or instruction for the subagent. It sees this text " +
+          "plus its own session context, not your conversation — reference " +
+          "its work, not things you only said locally.",
       }),
     }),
     execute: async (_toolId, params) => {
@@ -561,7 +564,7 @@ function setupParent(
           {
             type: "text" as const,
             text:
-              `Message delivered to subagent ${id}. It will act on it and may ` +
+              `Message delivered to subagent ${id}. It will act on it and ` +
               "report again; do not poll.",
           },
         ],
@@ -639,23 +642,32 @@ function setupParent(
 
 function subagentSystemPrompt(branch?: string): string {
   const workspace = branch
-    ? `You work in an isolated Git worktree on branch ${branch}. For code ` +
-      "changes, commit all work before reporting so the parent can review and " +
-      "merge the branch; repository commit hooks provide its validation. "
-    : "You share the parent's working tree, so your edits are immediately visible. ";
+    ? `You work in an isolated Git worktree on branch ${branch}. Commit all ` +
+      "work before reporting so the parent can review and merge the branch; " +
+      "repository commit hooks provide its validation."
+    : "You share the parent's working tree, so your edits are immediately " +
+      "visible to the parent.";
 
   return (
+    "# Role\n\n" +
     "You are a subagent executing one task delegated by a parent pi session. " +
-    "You see the task prompt and pi's normal project context, but not the " +
-    "parent's conversation. " +
+    "You see the task and pi's normal project context, but not the parent's " +
+    "conversation. Focus only on the delegated task. " +
     workspace +
-    "Focus only on the delegated task. Report with report_result when you " +
-    "believe it is done, then end your turn and wait: the session stays alive " +
-    "while the parent reviews. The parent may send revision requests as " +
-    "ordinary messages — act on them and report again — and closes the session " +
-    "when the work is accepted. Only report_result reaches the parent; " +
-    "interactive replies stay local. If the user asks for current findings, " +
-    "call report_result even when the task is incomplete."
+    "\n\n" +
+    "# Reporting to the parent\n\n" +
+    "report_result is the only channel that reaches the parent. It cannot " +
+    "see your text replies, your tool output, or anything else in this " +
+    "session — so a turn that ends in plain text leaves the parent waiting " +
+    "forever, with no way to know you responded.\n\n" +
+    "- Call report_result when the task is done, when you have acted on a " +
+    "revision request from the parent, and when you are blocked and need " +
+    "the parent's input.\n" +
+    "- Every message from the parent calls for a report_result response, " +
+    "even if the report is only a brief status update.\n" +
+    "- After reporting, end your turn and wait. The session stays alive: " +
+    "the parent reviews each report and either sends you a revision request " +
+    "as an ordinary message or closes the session."
   );
 }
 
@@ -685,10 +697,17 @@ function processAgentLine(
 
   if (candidate.type === "message" && typeof candidate.text === "string") {
     // followUp: let a busy child finish its current work before the verdict.
+    // The tags and the trailing instruction matter: without an explicit cue
+    // to report back, a child may answer in plain text and end its turn,
+    // which never reaches the parent.
     pi.sendMessage(
       {
         customType: MESSAGE_TYPE,
-        content: `Message from parent:\n\n${candidate.text}`,
+        content:
+          `<message-from-parent>\n${candidate.text}\n</message-from-parent>\n\n` +
+          "Act on this message, then report the outcome with report_result. " +
+          "The parent receives only report_result output — it cannot see " +
+          "your text replies.",
         display: true,
       },
       { triggerTurn: true, deliverAs: "followUp" },
@@ -729,9 +748,11 @@ function setupChild(
     name: "report_result",
     label: "Report Result",
     description:
-      "Send a result report to the parent. Use when the task is done, when " +
-      "reporting a requested revision, or when the user asks for current " +
-      "findings. Report outcomes, not progress updates.",
+      "Send a result report to the parent — the only channel that reaches " +
+      "it. The parent cannot see your text replies. Use when the task is " +
+      "done, when reporting a requested revision, or when you are " +
+      "blocked and need the parent's input. Report outcomes, not " +
+      "progress updates.",
     parameters: Type.Object({
       result: Type.String({
         description:
