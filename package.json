@@ -1,19 +1,40 @@
 {
   "name": "fork",
-  "private": true,
+  "version": "0.0.0",
+  "description": "Subagents for Pi — spawn pi sessions in tmux windows with task delegation and revision loops",
   "type": "module",
+  "packageManager": "pnpm@11.3.0",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "format": "biome check --write .",
+    "format:check": "biome check .",
+    "prepare": "husky"
+  },
   "pi": {
     "extensions": [
       "./index.ts"
     ]
   },
-  "devDependencies": {
-    "@biomejs/biome": "^2.4.15",
-    "husky": "^9.1.7",
-    "lint-staged": "^17.0.5"
+  "dependencies": {
+    "typebox": "^1.1.37"
   },
-  "scripts": {
-    "prepare": "husky"
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.8",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@earendil-works/pi-tui": "^0.84.2",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.3.0",
+    "typescript": "^6.0.3"
   },
   "lint-staged": {
     "*.ts": "biome check --write"

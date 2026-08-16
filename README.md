@@ -53,3 +53,15 @@ Under `~/.pi/agent/extensions/fork/` (sockets and task files are mode `0o600`):
 ## Orphans
 
 None handled. If a parent dies with children alive: kill their tmux windows, `git worktree remove` any worktrees under `~/.pi/worktrees/`, delete their task files. Agent branches are always retained, whatever happens.
+
+## Development
+
+Requires Node.js 22.18 or newer and pnpm 11.3.0.
+
+```sh
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm format:check
+```
+
+Use `pnpm format` to apply formatting.

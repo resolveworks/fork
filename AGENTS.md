@@ -6,6 +6,18 @@ The extension exposes `spawn_agent`, `message_agent`, and `close_agent` tools to
 
 Everything lives in `index.ts` — start at the default export.
 
+## Development
+
+Requires Node.js 22.18 or newer and pnpm 11.3.0.
+
+```sh
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm format:check
+```
+
+Use `pnpm format` to apply formatting. Run the typecheck and formatting check before finishing a change; the pre-commit hook enforces both.
+
 ## Requirements
 
 - **tmux.** The extension silently no-ops outside tmux.

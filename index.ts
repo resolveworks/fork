@@ -28,7 +28,11 @@ import {
   CONFIG_DIR_NAME,
   type ExtensionAPI,
   getAgentDir,
+  getMarkdownTheme,
+  keyHint,
+  type MessageRenderer,
 } from "@earendil-works/pi-coding-agent";
+import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ── tmux ────────────────────────────────────────────────────────────
@@ -43,16 +47,10 @@ function tmuxSync(args: string[], timeout = 3000): string {
   const result = spawnSync("tmux", args, { encoding: "utf-8", timeout });
   if (result.error) throw result.error;
   if (result.status !== 0 || result.signal) {
-    const detail = [result.stderr.trim(), result.stdout.trim()]
-      .filter(Boolean)
-      .join(" / ");
+    const detail = [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join(" / ");
     const where =
-      result.signal !== null
-        ? `signal ${result.signal}`
-        : `exit ${result.status ?? "?"}`;
-    throw new Error(
-      `fork: tmux ${args[0]} failed (${where})${detail ? `: ${detail}` : ""}`,
-    );
+      result.signal !== null ? `signal ${result.signal}` : `exit ${result.status ?? "?"}`;
+    throw new Error(`fork: tmux ${args[0]} failed (${where})${detail ? `: ${detail}` : ""}`);
   }
   return result.stdout;
 }
@@ -74,6 +72,52 @@ const BRANCH_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const RESULT_TYPE = "fork-result";
 const MESSAGE_TYPE = "fork-message";
 
+/** Number of markdown lines shown when the message row is collapsed (ctrl+o to expand). */
+const PREVIEW_LINES = 10;
+
+/** Render fork messages like pi's default custom-message rendering, plus a
+ * collapsed preview with an expand hint for long subagent reports. */
+const renderForkMessage: MessageRenderer = (message, options, theme) => {
+  const text =
+    typeof message.content === "string"
+      ? message.content
+      : message.content
+          .filter((item) => item.type === "text")
+          .map((item) => item.text ?? "")
+          .join("\n");
+
+  let body = text;
+  let hint = "";
+  if (!options.expanded) {
+    const lines = text.split("\n");
+    if (lines.length > PREVIEW_LINES) {
+      const remaining = lines.length - PREVIEW_LINES;
+      hint =
+        theme.fg("muted", `... (${remaining} more lines,`) +
+        " " +
+        keyHint("app.tools.expand", "to expand") +
+        theme.fg("muted", ")");
+      body = lines.slice(0, PREVIEW_LINES).join("\n");
+    }
+  }
+
+  const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+  box.addChild(
+    new Text(theme.fg("customMessageLabel", theme.bold(`[${message.customType}]`)), 0, 0),
+  );
+  box.addChild(new Spacer(1));
+  box.addChild(
+    new Markdown(body, 0, 0, getMarkdownTheme(), {
+      color: (t) => theme.fg("customMessageText", t),
+    }),
+  );
+  if (hint) {
+    box.addChild(new Spacer(1));
+    box.addChild(new Text(hint, 0, 0));
+  }
+  return box;
+};
+
 function socketPathFor(sessionId: string): string {
   return path.join(SOCKETS_DIR, `${sessionId}.sock`);
 }
@@ -91,8 +135,7 @@ function worktreePathFor(id: string): string {
 }
 
 /** Exact lowercase format emitted by randomUUID(); also blocks path traversal. */
-const UUID_V4 =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 // ── wire protocol (newline-delimited JSON) ──────────────────────────
 
@@ -128,9 +171,7 @@ function readConfig(file: string): ForkConfig {
 /** Merge global + project config. Project wins; only read if trusted. */
 function loadConfig(cwd: string, projectTrusted: boolean): ForkConfig {
   const globalCfg = readConfig(path.join(getAgentDir(), "fork.json"));
-  const projectCfg = projectTrusted
-    ? readConfig(path.join(cwd, CONFIG_DIR_NAME, "fork.json"))
-    : {};
+  const projectCfg = projectTrusted ? readConfig(path.join(cwd, CONFIG_DIR_NAME, "fork.json")) : {};
   return { ...globalCfg, ...projectCfg };
 }
 
@@ -161,19 +202,14 @@ async function git(
       .join(" / ")
       .slice(-4000);
     const where = result.killed ? "killed" : `exit ${result.code}`;
-    throw new Error(
-      `fork: git ${args[0]} failed (${where})${detail ? `: ${detail}` : ""}`,
-    );
+    throw new Error(`fork: git ${args[0]} failed (${where})${detail ? `: ${detail}` : ""}`);
   }
   return result.stdout;
 }
 
 /** Remove a worktree created by a failed spawn, then delete its new branch.
  * Cleanup is best-effort so the original spawn error remains authoritative. */
-async function rollbackWorktree(
-  pi: ExtensionAPI,
-  info: WorktreeInfo,
-): Promise<void> {
+async function rollbackWorktree(pi: ExtensionAPI, info: WorktreeInfo): Promise<void> {
   try {
     await git(pi, ["worktree", "remove", "--force", info.path], info.repoCwd);
   } catch (err) {
@@ -196,9 +232,7 @@ async function createWorktree(
   signal?: AbortSignal,
 ): Promise<WorktreeInfo> {
   if (!BRANCH_NAME.test(branchName)) {
-    throw new Error(
-      "fork: branch names must use lowercase letters, numbers, and single dashes",
-    );
+    throw new Error("fork: branch names must use lowercase letters, numbers, and single dashes");
   }
   const branch = `${BRANCH_PREFIX}${branchName}`;
 
@@ -207,12 +241,7 @@ async function createWorktree(
   fs.mkdirSync(WORKTREES_DIR, { recursive: true });
   const info = { path: worktreePathFor(id), branch, repoCwd: cwd };
   try {
-    await git(
-      pi,
-      ["worktree", "add", "--quiet", "-b", branch, info.path, "HEAD"],
-      cwd,
-      signal,
-    );
+    await git(pi, ["worktree", "add", "--quiet", "-b", branch, info.path, "HEAD"], cwd, signal);
   } catch (err) {
     // post-checkout can fail after creating both artifacts. Git rejects an
     // existing branch before creating our path, so .git proves these are ours.
@@ -237,29 +266,14 @@ function spawn(
 ): void {
   // argv passed directly; tmux runs a multi-arg command without `sh -c`, so
   // no shell quoting is needed. Let pi resolve model settings itself.
-  const cmdArgs = [
-    "pi",
-    "--subagent-socket",
-    socketPathFor(sessionId),
-    "--subagent-id",
-    id,
-  ];
+  const cmdArgs = ["pi", "--subagent-socket", socketPathFor(sessionId), "--subagent-id", id];
   if (config.provider) cmdArgs.push("--provider", config.provider);
   if (config.model) cmdArgs.push("--model", config.model);
   if (config.thinking) cmdArgs.push("--thinking", config.thinking);
   if (branch) cmdArgs.push("--subagent-branch", branch);
   cmdArgs.push(`@${taskPath}`);
 
-  tmuxSync([
-    "new-window",
-    "-t",
-    `${session}:`,
-    "-n",
-    id,
-    "-c",
-    cwd,
-    ...cmdArgs,
-  ]);
+  tmuxSync(["new-window", "-t", `${session}:`, "-n", id, "-c", cwd, ...cmdArgs]);
 }
 
 // ── line servers and socket writes ──────────────────────────────────
@@ -282,11 +296,7 @@ function safeUnlink(filePath: string, what: string): void {
  * and the peer reports connection failures on its side. Mode 0o600 is
  * enforced once listening starts.
  */
-function serveLines(
-  sockPath: string,
-  what: string,
-  onLine: (line: string) => void,
-): net.Server {
+function serveLines(sockPath: string, what: string, onLine: (line: string) => void): net.Server {
   safeUnlink(sockPath, `stale ${what}`);
   const server = net.createServer((socket) => {
     let buf = "";
@@ -321,10 +331,7 @@ function teardownServer(server: net.Server, sockPath: string, what: string) {
   // close() with a callback absorbs ERR_SERVER_NOT_RUNNING instead of
   // emitting an unhandled 'error'.
   server.close((err) => {
-    if (
-      err &&
-      (err as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING"
-    ) {
+    if (err && (err as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
       console.error(`fork: error closing ${what}: ${err}`);
     }
   });
@@ -349,9 +356,7 @@ function sendToAgent(id: string, message: AgentMessage): Promise<void> {
     };
     socket.setTimeout(5000);
     socket.once("error", (err) => finish(err));
-    socket.once("timeout", () =>
-      finish(new Error("timed out after 5 seconds")),
-    );
+    socket.once("timeout", () => finish(new Error("timed out after 5 seconds")));
     socket.end(`${JSON.stringify(message)}\n`, () => finish());
   });
 }
@@ -380,9 +385,7 @@ function processResultLine(pi: ExtensionAPI, line: string): void {
   try {
     parsed = JSON.parse(line);
   } catch (err) {
-    console.error(
-      `fork: ignoring malformed result line (invalid JSON): ${err}`,
-    );
+    console.error(`fork: ignoring malformed result line (invalid JSON): ${err}`);
     return;
   }
 
@@ -400,9 +403,7 @@ function processResultLine(pi: ExtensionAPI, line: string): void {
 
   const { id, summary } = candidate as ResultPayload;
   if (!UUID_V4.test(id)) {
-    console.error(
-      `fork: ignoring result with invalid subagent id (not a UUID v4): ${id}`,
-    );
+    console.error(`fork: ignoring result with invalid subagent id (not a UUID v4): ${id}`);
     return;
   }
 
@@ -438,13 +439,13 @@ function setupParent(
   const sockPath = socketPathFor(sessionId);
 
   // Task files are authoritative, so running children survive extension reloads.
-  const server = serveLines(sockPath, "result socket", (line) =>
-    processResultLine(pi, line),
-  );
+  const server = serveLines(sockPath, "result socket", (line) => processResultLine(pi, line));
 
   pi.on("session_shutdown", () => {
     teardownServer(server, sockPath, "result socket");
   });
+
+  pi.registerMessageRenderer(RESULT_TYPE, renderForkMessage);
 
   pi.registerTool({
     name: "spawn_agent",
@@ -508,9 +509,7 @@ function setupParent(
         throw err;
       }
 
-      const location = worktree
-        ? `${worktree.path} on branch ${worktree.branch}`
-        : toolCtx.cwd;
+      const location = worktree ? `${worktree.path} on branch ${worktree.branch}` : toolCtx.cwd;
       return {
         content: [
           {
@@ -609,11 +608,7 @@ function setupParent(
       let cleanupWarning = "";
       if (hasWorktree) {
         try {
-          await git(
-            pi,
-            ["worktree", "remove", "--force", worktreePath],
-            worktreePath,
-          );
+          await git(pi, ["worktree", "remove", "--force", worktreePath], worktreePath);
         } catch (err) {
           cleanupWarning = ` Worktree cleanup failed: ${err}. Remove ${worktreePath} manually.`;
           console.error(`fork:${cleanupWarning}`);
@@ -676,11 +671,7 @@ function subagentSystemPrompt(branch?: string): string {
  * shape is logged and ignored without aborting the handler or dropping later
  * lines.
  */
-function processAgentLine(
-  pi: ExtensionAPI,
-  ctx: { shutdown: () => void },
-  line: string,
-): void {
+function processAgentLine(pi: ExtensionAPI, ctx: { shutdown: () => void }, line: string): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(line);
@@ -786,9 +777,7 @@ function setupChild(
 
           socket.setTimeout(5000);
           socket.once("error", (err) => finish(err));
-          socket.once("timeout", () =>
-            finish(new Error("timed out after 5 seconds")),
-          );
+          socket.once("timeout", () => finish(new Error("timed out after 5 seconds")));
           socket.end(payload, () => finish());
         });
       } catch (err) {
@@ -829,6 +818,8 @@ function setupChild(
   pi.on("session_shutdown", () => {
     teardownServer(server, agentSockPath, "agent socket");
   });
+
+  pi.registerMessageRenderer(MESSAGE_TYPE, renderForkMessage);
 }
 
 // ── extension entry ────────────────────────────────────────────────
