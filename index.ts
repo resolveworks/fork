@@ -458,9 +458,10 @@ function setupParent(
       "sequential, or context-dependent work yourself. The subagent sees the " +
       "task plus normal project context (AGENTS.md, files), but not this " +
       "conversation, so include needed context in the task. Avoid concurrent " +
-      "editing agents in shared mode. Returns immediately; the report arrives " +
-      "later as a message. Then request revisions with message_agent or close " +
-      "it with close_agent.",
+      "editing agents in shared mode. Returns immediately with a spawn " +
+      "confirmation. The report arrives later as a message that starts a new " +
+      "turn; do not poll or sleep. Continue other work or end your turn. Then " +
+      "request revisions with message_agent or close it with close_agent.",
     parameters: Type.Object({
       task: Type.String({
         description:
@@ -516,9 +517,9 @@ function setupParent(
             type: "text" as const,
             text:
               `Spawned subagent ${id} in ${location}. ` +
-              "Do not poll it; continue other work or end your response. Its " +
-              "report will arrive in a new turn, after which it stays alive " +
-              "awaiting your verdict.",
+              "Do not poll or sleep; continue other work or end your turn. Its " +
+              "report will arrive as a message that starts a new turn, after " +
+              "which it stays alive awaiting your verdict.",
           },
         ],
         details: {},
@@ -534,7 +535,7 @@ function setupParent(
       "It receives your text as a new turn, acts on it, and reports again. " +
       "Use after reviewing its report when changes are needed; use " +
       "close_agent when the work is accepted. The next report arrives as a " +
-      "message — do not poll.",
+      "message that starts a new turn; do not poll or sleep.",
     parameters: Type.Object({
       id: Type.String({
         description: "The subagent's UUID, from its spawn result or report.",
@@ -563,8 +564,8 @@ function setupParent(
           {
             type: "text" as const,
             text:
-              `Message delivered to subagent ${id}. It will act on it and ` +
-              "report again; do not poll.",
+              `Message delivered to subagent ${id}. Do not poll or sleep; its ` +
+              "report will arrive as a message that starts a new turn.",
           },
         ],
         details: {},
