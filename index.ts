@@ -273,7 +273,7 @@ function spawn(
   if (branch) cmdArgs.push("--subagent-branch", branch);
   cmdArgs.push(`@${taskPath}`);
 
-  tmuxSync(["new-window", "-t", `${session}:`, "-n", id, "-c", cwd, ...cmdArgs]);
+  tmuxSync(["new-window", "-d", "-t", `${session}:`, "-n", id, "-c", cwd, ...cmdArgs]);
 }
 
 // ── line servers and socket writes ──────────────────────────────────
