@@ -5,9 +5,14 @@
  * tools. Calling spawn_agent opens a new tmux window running pi with the
  * given task and returns immediately. The child reports results through `report_result`;
  * each report is delivered over a Unix socket as a notification that triggers
- * a new parent turn. The child stays alive after reporting: the parent
- * reviews the report, sends revision requests with message_agent, and closes
- * the child with close_agent.
+ * a new parent turn: if the parent is idle the report starts a turn at
+ * once; if it is mid-turn the report is queued as a follow-up and runs as a
+ * fresh turn once the parent's current work finishes. An interrupt clears
+ * that queue without delivering queued custom messages, so reports are
+ * tracked until delivery is confirmed and re-delivered when an interrupted
+ * run settles. The child stays alive after
+ * reporting: the parent reviews the report, sends revision requests with
+ * message_agent, and closes the child with close_agent.
  *
  * Configure the subagent model via ~/.pi/agent/fork.json (global) or
  * .pi/fork.json (project, overrides global). Any field is optional:
@@ -363,15 +368,35 @@ function sendToAgent(id: string, message: AgentMessage): Promise<void> {
 
 // ── result delivery ─────────────────────────────────────────────────
 
-function deliverResult(pi: ExtensionAPI, payload: ResultPayload): void {
+/** Deliver one report as a fork-result message, tracked in `undelivered`.
+ *
+ * A report is the parent's next unit of work, not a course correction of
+ * whatever it is doing right now, so it is delivered as a follow-up — the
+ * same idiom pi's own examples use for async events the agent must act on
+ * (plan-mode, git-merge-and-resolve), and symmetric with how message_agent
+ * addresses the child. A report that arrives while the parent is mid-turn
+ * waits in pi's follow-up queue until the parent finishes, then runs as a
+ * fresh turn. That queue is cleared without delivering when the parent is
+ * interrupted (escape) — pi only restores typed text to the editor — so every
+ * report is tracked until its message_end confirms delivery; agent_settled
+ * re-delivers the rest (see setupParent). The nonce rides in `details`,
+ * which never reaches the LLM. */
+function deliverResult(
+  pi: ExtensionAPI,
+  payload: ResultPayload,
+  undelivered: Map<string, ResultPayload>,
+): void {
   const summary = payload.summary.trim() || "(no output)";
+  const nonce = randomUUID();
+  undelivered.set(nonce, payload);
   pi.sendMessage(
     {
       customType: RESULT_TYPE,
       content: `Subagent ${payload.id} reported:\n\n${summary}`,
       display: true,
+      details: { nonce },
     },
-    { triggerTurn: true },
+    { triggerTurn: true, deliverAs: "followUp" },
   );
 }
 
@@ -380,7 +405,7 @@ function deliverResult(pi: ExtensionAPI, payload: ResultPayload): void {
  * is logged and ignored without aborting the handler or dropping later lines.
  * A result is delivered only while its agent is still open (task file present).
  */
-function processResultLine(pi: ExtensionAPI, line: string): void {
+function processResultLine(line: string, deliver: (payload: ResultPayload) => void): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(line);
@@ -412,7 +437,7 @@ function processResultLine(pi: ExtensionAPI, line: string): void {
     return;
   }
 
-  deliverResult(pi, { id, summary });
+  deliver({ id, summary });
 }
 
 // ── parent setup ────────────────────────────────────────────────────
@@ -438,8 +463,33 @@ function setupParent(
   const sessionId = ctx.sessionManager.getSessionId();
   const sockPath = socketPathFor(sessionId);
 
+  // Reports are tracked from sendMessage until their message_end confirms
+  // they reached the transcript. pi drains its queues before a session
+  // settles, so anything still tracked on agent_settled was dropped by an
+  // interrupt. Re-delivering is safe then: the session is idle, so each
+  // report triggers a fresh turn exactly as it would have without the
+  // interrupt.
+  const undelivered = new Map<string, ResultPayload>();
+  const deliver = (payload: ResultPayload) => deliverResult(pi, payload, undelivered);
+
   // Task files are authoritative, so running children survive extension reloads.
-  const server = serveLines(sockPath, "result socket", (line) => processResultLine(pi, line));
+  const server = serveLines(sockPath, "result socket", (line) => processResultLine(line, deliver));
+
+  pi.on("message_end", (event) => {
+    const message = event.message;
+    if (message.role !== "custom" || message.customType !== RESULT_TYPE) return;
+    const nonce = (message.details as { nonce?: string } | undefined)?.nonce;
+    if (nonce !== undefined) undelivered.delete(nonce);
+  });
+
+  pi.on("agent_settled", () => {
+    const dropped = [...undelivered.values()];
+    undelivered.clear();
+    for (const payload of dropped) {
+      console.error(`fork: re-delivering report of subagent ${payload.id} dropped by an interrupt`);
+      deliver(payload);
+    }
+  });
 
   pi.on("session_shutdown", () => {
     teardownServer(server, sockPath, "result socket");

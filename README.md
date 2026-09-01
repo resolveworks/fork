@@ -22,7 +22,7 @@ The parent session gains three tools:
 - `message_agent({ id, text })` — delivers a revision request as an ordinary follow-up turn in the child.
 - `close_agent({ id })` — mechanical shutdown; no model turn spent.
 
-The child gains `report_result({ result })`. The report travels over a Unix socket and arrives in the parent as a notification that triggers a new turn. The child stays alive after reporting, awaiting the verdict: revisions via `message_agent`, or closure. Reports are outcomes, not progress updates. If delivery fails, the child is told unambiguously and retries with the same payload — a retry cannot double-deliver.
+The child gains `report_result({ result })`. The report travels over a Unix socket and arrives in the parent as a follow-up notification: immediately if the parent is idle, or as the parent's next turn once its current work finishes. The child stays alive after reporting, awaiting the verdict: revisions via `message_agent`, or closure. Reports are outcomes, not progress updates. If delivery fails, the child is told unambiguously and retries with the same payload — a retry cannot double-deliver. Interrupting the parent would drop its queued notifications, so fork re-delivers them once the interrupted run settles — an escape can no longer lose a report.
 
 Don't poll. Navigate windows with your usual tmux keys.
 
