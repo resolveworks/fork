@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       typebox:
-        specifier: ^1.1.37
+        specifier: '*'
         version: 1.3.14
     devDependencies:
       '@biomejs/biome':
