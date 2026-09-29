@@ -4,13 +4,13 @@
  * The parent registers `spawn_agent`, `message_agent`, and `close_agent`
  * tools. Calling spawn_agent opens a new tmux window running pi with the
  * given task and returns immediately. The child reports results through `report_result`;
- * each report is delivered over a Unix socket as a notification that triggers
- * a new parent turn: if the parent is idle the report starts a turn at
- * once; if it is mid-turn the report is queued as a follow-up and runs as a
- * fresh turn once the parent's current work finishes. An interrupt clears
- * that queue without delivering queued custom messages, so reports are
- * tracked until delivery is confirmed and re-delivered when an interrupted
- * run settles. The child stays alive after
+ * each report is delivered over a Unix socket as a notification that reaches
+ * the parent promptly: if the parent is idle the report starts a turn at
+ * once; if it is mid-run the report is steered into that run — delivered
+ * after its current tool calls, before the next LLM call. An interrupt
+ * clears the steering queue without delivering queued custom messages, so
+ * reports are tracked until delivery is confirmed and re-delivered when an
+ * interrupted run settles. The child stays alive after
  * reporting: the parent reviews the report, sends revision requests with
  * message_agent, and closes the child with close_agent.
  *
@@ -370,17 +370,17 @@ function sendToAgent(id: string, message: AgentMessage): Promise<void> {
 
 /** Deliver one report as a fork-result message, tracked in `undelivered`.
  *
- * A report is the parent's next unit of work, not a course correction of
- * whatever it is doing right now, so it is delivered as a follow-up — the
- * same idiom pi's own examples use for async events the agent must act on
- * (plan-mode, git-merge-and-resolve), and symmetric with how message_agent
- * addresses the child. A report that arrives while the parent is mid-turn
- * waits in pi's follow-up queue until the parent finishes, then runs as a
- * fresh turn. That queue is cleared without delivering when the parent is
- * interrupted (escape) — pi only restores typed text to the editor — so every
- * report is tracked until its message_end confirms delivery; agent_settled
- * re-delivers the rest (see setupParent). The nonce rides in `details`,
- * which never reaches the LLM. */
+ * A report is steered into the parent's current run: it is delivered after
+ * the current tool calls, before the next LLM call, so the parent can fold
+ * it into the work at hand rather than waiting for the run to finish (the
+ * follow-up idiom pi's examples use fits events that must run as fresh
+ * turns; a report is news the parent can use now). A report that arrives
+ * while the parent is idle starts a turn at once. The steering queue is
+ * cleared without delivering when the parent is interrupted (escape) — pi
+ * only restores typed text to the editor — so every report is tracked until
+ * its message_end confirms delivery; agent_settled re-delivers the rest
+ * (see setupParent). The nonce rides in `details`, which never reaches the
+ * LLM. */
 function deliverResult(
   pi: ExtensionAPI,
   payload: ResultPayload,
@@ -396,7 +396,7 @@ function deliverResult(
       display: true,
       details: { nonce },
     },
-    { triggerTurn: true, deliverAs: "followUp" },
+    { triggerTurn: true, deliverAs: "steer" },
   );
 }
 
@@ -509,8 +509,9 @@ function setupParent(
       "task plus normal project context (AGENTS.md, files), but not this " +
       "conversation, so include needed context in the task. Avoid concurrent " +
       "editing agents in shared mode. Returns immediately with a spawn " +
-      "confirmation. The report arrives later as a message that starts a new " +
-      "turn; do not poll or sleep. Continue other work or end your turn. Then " +
+      "confirmation. The report arrives later as a message in this " +
+      "session — steered into current work or a new turn when idle; do not " +
+      "poll or sleep. Continue other work or end your turn. Then " +
       "request revisions with message_agent or close it with close_agent.",
     parameters: Type.Object({
       task: Type.String({
@@ -568,8 +569,8 @@ function setupParent(
             text:
               `Spawned subagent ${id} in ${location}. ` +
               "Do not poll or sleep; continue other work or end your turn. Its " +
-              "report will arrive as a message that starts a new turn, after " +
-              "which it stays alive awaiting your verdict.",
+              "report will arrive as a message in this session, after which it " +
+              "stays alive awaiting your verdict.",
           },
         ],
         details: {},
@@ -585,7 +586,7 @@ function setupParent(
       "It receives your text as a new turn, acts on it, and reports again. " +
       "Use after reviewing its report when changes are needed; use " +
       "close_agent when the work is accepted. The next report arrives as a " +
-      "message that starts a new turn; do not poll or sleep.",
+      "message in this session; do not poll or sleep.",
     parameters: Type.Object({
       id: Type.String({
         description: "The subagent's UUID, from its spawn result or report.",
@@ -615,7 +616,7 @@ function setupParent(
             type: "text" as const,
             text:
               `Message delivered to subagent ${id}. Do not poll or sleep; its ` +
-              "report will arrive as a message that starts a new turn.",
+              "report will arrive as a message in this session.",
           },
         ],
         details: {},
