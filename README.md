@@ -19,7 +19,7 @@ pi -e git:github.com/resolveworks/fork
 The parent session gains three tools:
 
 - `spawn_agent({ task, branch? })` — writes the task to a file and opens a new tmux window running `pi @<taskfile>`. Returns immediately. The child sees the task plus normal project context, not the parent's conversation, so the task must be self-contained.
-- `message_agent({ id, text })` — delivers a revision request as an ordinary follow-up turn in the child.
+- `message_agent({ id, text })` — steers a revision request into the child's current run, or starts a new turn when the child is idle.
 - `close_agent({ id })` — mechanical shutdown; no model turn spent.
 
 The child gains `report_result({ result })`. The report travels over a Unix socket and arrives in the parent as a steering notification: immediately if the parent is idle, or injected into the parent's current run after its pending tool calls. The child stays alive after reporting, awaiting the verdict: revisions via `message_agent`, or closure. Reports are outcomes, not progress updates. If delivery fails, the child is told unambiguously and retries with the same payload — a retry cannot double-deliver. Interrupting the parent would drop its queued notifications, so fork re-delivers them once the interrupted run settles — an escape can no longer lose a report.

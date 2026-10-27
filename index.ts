@@ -734,7 +734,9 @@ function processAgentLine(pi: ExtensionAPI, line: string): void {
   const candidate = parsed as { type?: unknown; text?: unknown };
 
   if (candidate.type === "message" && typeof candidate.text === "string") {
-    // followUp: let a busy child finish its current work before the verdict.
+    // steer: a revision request is news the child can fold into its current
+    // run; it is delivered after the child's pending tool calls, before its
+    // next LLM call.
     // The tags and the trailing instruction matter: without an explicit cue
     // to report back, a child may answer in plain text and end its turn,
     // which never reaches the parent.
@@ -748,7 +750,7 @@ function processAgentLine(pi: ExtensionAPI, line: string): void {
           "your text replies.",
         display: true,
       },
-      { triggerTurn: true, deliverAs: "followUp" },
+      { triggerTurn: true, deliverAs: "steer" },
     );
     return;
   }
