@@ -1,8 +1,21 @@
 # fork
 
-Spawn [pi](https://github.com/earendil-works/pi) subagents in tmux windows. Written for my own use; it assumes fluency with pi, tmux, and git worktrees, and stays out of the way — including silently doing nothing outside tmux.
+Spawn [pi](https://github.com/earendil-works/pi) subagents in tmux windows. Each child is a separate pi process you can watch and type into; it reports back over a Unix socket and stays alive for revision requests. Assumes fluency with pi, tmux, and git worktrees, and stays out of the way — including silently doing nothing outside tmux.
+
+## Requirements
+
+- pi 0.80.4 or newer (newest pi API used: `agent_settled`)
+- tmux, with pi running inside it
+- git, for `branch` worktree isolation
+- Linux; macOS untested (nothing Linux-specific), Windows unsupported
 
 ## Install
+
+```bash
+pi install npm:@resolveworks/fork
+```
+
+Or from git:
 
 ```bash
 pi install git:github.com/resolveworks/fork
@@ -11,8 +24,10 @@ pi install git:github.com/resolveworks/fork
 Or once, without installing:
 
 ```bash
-pi -e git:github.com/resolveworks/fork
+pi -e npm:@resolveworks/fork
 ```
+
+Then restart pi, or `/reload`.
 
 ## What you get
 
@@ -50,10 +65,6 @@ Under `~/.pi/agent/extensions/fork/` (sockets and task files are mode `0o600`):
 - `agents/<uuid>.sock` — verdict channel, parent → child
 - `tasks/<uuid>.md` — the task handed to the child; a present task file marks an open agent and is authoritative across extension reloads
 
-## Orphans
-
-None handled. If a parent dies with children alive: kill their tmux windows, `git worktree remove` any worktrees under `~/.pi/worktrees/`, delete their task files. Agent branches are always retained, whatever happens.
-
 ## Development
 
 Requires Node.js 22.18 or newer and pnpm 11.3.0.
@@ -65,3 +76,7 @@ pnpm format:check
 ```
 
 Use `pnpm format` to apply formatting.
+
+## License
+
+MIT
