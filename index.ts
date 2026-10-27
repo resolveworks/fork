@@ -151,7 +151,7 @@ interface ResultPayload {
 }
 
 /** Parent → child, over the child's agent socket. */
-type AgentMessage = { type: "message"; text: string } | { type: "close" };
+type AgentMessage = { type: "message"; text: string };
 
 // ── config (~/.pi/agent/fork.json, .pi/fork.json) ───────────────────
 
@@ -644,17 +644,15 @@ function setupParent(
       const worktreePath = worktreePathFor(id);
       const hasWorktree = fs.existsSync(path.join(worktreePath, ".git"));
 
+      // Kill the window first: SIGHUP reaches the whole process group, so
+      // in-flight tool subprocesses die with the session, and pi's signal
+      // path runs session_shutdown teardown without waiting for a busy
+      // session to settle. A failure means the window is already gone;
+      // cleanup proceeds either way.
       try {
-        await sendToAgent(id, { type: "close" });
-      } catch (err) {
-        const cleanup = hasWorktree
-          ? `remove worktree ${worktreePath} with git worktree remove --force ` +
-            "and remove its task file manually; its branch will be retained"
-          : "remove its task file manually";
-        throw new Error(
-          `Could not reach subagent ${id}: ${err}. It may still be starting ` +
-            `(retry shortly); if its tmux window is already gone, ${cleanup}.`,
-        );
+        tmuxSync(["kill-window", "-t", `${session}:=${id}`]);
+      } catch {
+        // Window already closed, renamed, or session gone — nothing to kill.
       }
 
       let cleanupWarning = "";
@@ -673,10 +671,7 @@ function setupParent(
         content: [
           {
             type: "text" as const,
-            text:
-              `Subagent ${id} received the close message and is shutting down.` +
-              retained +
-              cleanupWarning,
+            text: `Closed subagent ${id}; killed its tmux window.${retained}${cleanupWarning}`,
           },
         ],
         details: {},
@@ -723,7 +718,7 @@ function subagentSystemPrompt(branch?: string): string {
  * shape is logged and ignored without aborting the handler or dropping later
  * lines.
  */
-function processAgentLine(pi: ExtensionAPI, ctx: { shutdown: () => void }, line: string): void {
+function processAgentLine(pi: ExtensionAPI, line: string): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(line);
@@ -758,18 +753,11 @@ function processAgentLine(pi: ExtensionAPI, ctx: { shutdown: () => void }, line:
     return;
   }
 
-  if (candidate.type === "close") {
-    // Approval: shut down mechanically, no model turn spent on it.
-    ctx.shutdown();
-    return;
-  }
-
   console.error(`fork: ignoring malformed agent message: ${line}`);
 }
 
 function setupChild(
   pi: ExtensionAPI,
-  ctx: { shutdown: () => void },
   socketPath: string,
   subagentId: string,
   branch?: string,
@@ -863,9 +851,7 @@ function setupChild(
 
   fs.mkdirSync(AGENTS_DIR, { recursive: true });
   const agentSockPath = agentSocketPathFor(subagentId);
-  const server = serveLines(agentSockPath, "agent socket", (line) =>
-    processAgentLine(pi, ctx, line),
-  );
+  const server = serveLines(agentSockPath, "agent socket", (line) => processAgentLine(pi, line));
 
   pi.on("session_shutdown", () => {
     teardownServer(server, agentSockPath, "agent socket");
@@ -906,6 +892,6 @@ export default function (pi: ExtensionAPI) {
     // Child mode
     const subagentId = pi.getFlag("subagent-id") as string;
     const branch = pi.getFlag("subagent-branch") as string | undefined;
-    setupChild(pi, ctx, socketPath, subagentId, branch);
+    setupChild(pi, socketPath, subagentId, branch);
   });
 }
