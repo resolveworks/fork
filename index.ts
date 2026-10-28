@@ -14,11 +14,14 @@
  * reporting: the parent reviews the report, sends revision requests with
  * message_agent, and closes the child with close_agent.
  *
- * Configure the subagent model via ~/.pi/agent/fork.json (global) or
- * .pi/fork.json (project, overrides global). Any field is optional:
- *   { "model": "glm-5.2", "provider": "zai", "thinking": "high" }
- * Fork passes these settings to the child pi process as CLI flags, so pi
- * resolves them using its normal startup rules.
+ * Configure subagent models via ~/.pi/agent/fork.json (global) or
+ * .pi/fork.json (project, overrides global): a default profile plus named
+ * options selected by tag:
+ *   { "default": { "model": "glm-5.2" },
+ *     "options": [{ "tag": "small", "description": "Fast routine tasks",
+ *       "model": "glm-4.7-air" }] }
+ * Fork passes the selected profile to the child pi process as CLI flags, so
+ * pi resolves them using its normal startup rules.
  *
  * Requires: run pi inside tmux.
  */
@@ -32,6 +35,7 @@ import * as path from "node:path";
 import {
   CONFIG_DIR_NAME,
   type ExtensionAPI,
+  type ExtensionContext,
   getAgentDir,
   getMarkdownTheme,
   keyHint,
@@ -155,7 +159,8 @@ type AgentMessage = { type: "message"; text: string };
 
 // ── config (~/.pi/agent/fork.json, .pi/fork.json) ───────────────────
 
-interface ForkConfig {
+/** Model settings passed to the child as CLI flags. */
+interface ModelProfile {
   /** Model id or pattern (supports `provider/id` and `:thinking`). */
   model?: string;
   provider?: string;
@@ -163,14 +168,22 @@ interface ForkConfig {
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 }
 
+/** A named profile, selectable via spawn_agent's model argument. */
+interface ModelOption extends ModelProfile {
+  tag: string;
+  /** Shown to the parent model to help it select a profile. */
+  description: string;
+}
+
+interface ForkConfig {
+  /** Profile for spawns without a model argument. */
+  default?: ModelProfile;
+  options?: ModelOption[];
+}
+
 function readConfig(file: string): ForkConfig {
-  try {
-    if (!fs.existsSync(file)) return {};
-    return JSON.parse(fs.readFileSync(file, "utf-8")) as ForkConfig;
-  } catch (err) {
-    console.error(`fork: failed to load ${file}: ${err}`);
-    return {};
-  }
+  if (!fs.existsSync(file)) return {};
+  return JSON.parse(fs.readFileSync(file, "utf-8")) as ForkConfig;
 }
 
 /** Merge global + project config. Project wins; only read if trusted. */
@@ -178,6 +191,14 @@ function loadConfig(cwd: string, projectTrusted: boolean): ForkConfig {
   const globalCfg = readConfig(path.join(getAgentDir(), "fork.json"));
   const projectCfg = projectTrusted ? readConfig(path.join(cwd, CONFIG_DIR_NAME, "fork.json")) : {};
   return { ...globalCfg, ...projectCfg };
+}
+
+/** The profile for a named tag, or `default` when no tag is given. */
+function resolveProfile(config: ForkConfig, tag: string | undefined): ModelProfile {
+  if (tag === undefined) return config.default ?? {};
+  const option = config.options?.find((option) => option.tag === tag);
+  if (option === undefined) throw new Error(`fork: unknown model tag "${tag}"`);
+  return option;
 }
 
 // ── git worktrees ───────────────────────────────────────────────────
@@ -266,15 +287,15 @@ function spawn(
   id: string,
   taskPath: string,
   cwd: string,
-  config: ForkConfig,
+  profile: ModelProfile,
   branch?: string,
 ): void {
   // argv passed directly; tmux runs a multi-arg command without `sh -c`, so
   // no shell quoting is needed. Let pi resolve model settings itself.
   const cmdArgs = ["pi", "--subagent-socket", socketPathFor(sessionId), "--subagent-id", id];
-  if (config.provider) cmdArgs.push("--provider", config.provider);
-  if (config.model) cmdArgs.push("--model", config.model);
-  if (config.thinking) cmdArgs.push("--thinking", config.thinking);
+  if (profile.provider) cmdArgs.push("--provider", profile.provider);
+  if (profile.model) cmdArgs.push("--model", profile.model);
+  if (profile.thinking) cmdArgs.push("--thinking", profile.thinking);
   if (branch) cmdArgs.push("--subagent-branch", branch);
   cmdArgs.push(`@${taskPath}`);
 
@@ -452,10 +473,10 @@ function assertOpenAgent(id: string): void {
   }
 }
 
-function setupParent(
-  pi: ExtensionAPI,
-  ctx: { sessionManager: { getSessionId: () => string } },
-): void {
+function setupParent(pi: ExtensionAPI, ctx: ExtensionContext): void {
+  const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+  const modelOptions = config.options ?? [];
+
   fs.mkdirSync(SOCKETS_DIR, { recursive: true });
   fs.mkdirSync(TASKS_DIR, { recursive: true });
 
@@ -501,18 +522,17 @@ function setupParent(
     name: "spawn_agent",
     label: "Spawn Agent",
     description:
-      "Delegate a self-contained task to a subagent: a fresh pi session in a " +
-      "new tmux window. By default it shares your working tree; provide branch " +
-      "to create an isolated Git worktree on a new agent/<name> branch. Use " +
-      "for independent work that benefits from isolated context; do simple, " +
-      "sequential, or context-dependent work yourself. The subagent sees the " +
-      "task plus normal project context (AGENTS.md, files), but not this " +
-      "conversation, so include needed context in the task. Avoid concurrent " +
-      "editing agents in shared mode. Returns immediately with a spawn " +
-      "confirmation. The report arrives later as a message in this " +
-      "session — steered into current work or a new turn when idle; do not " +
-      "poll or sleep. Continue other work or end your turn. Then " +
-      "request revisions with message_agent or close it with close_agent.",
+      "Delegate a self-contained task to a subagent in a fresh pi session and " +
+      "tmux window. Use this for independent work that benefits from isolated " +
+      "context; handle simple, sequential, or context-dependent work yourself. " +
+      "By default, the subagent shares your working tree; do not run concurrent " +
+      "editing agents in shared mode. Set branch to use an isolated Git worktree. " +
+      "The subagent sees the task and normal project context, but not this " +
+      "conversation, so include all necessary context in the task. This tool " +
+      "returns immediately. The subagent's report steers your current run, or " +
+      "starts a new turn if you are idle. Do not poll or sleep; continue other " +
+      "work or end your turn. After the report arrives, review its work, then " +
+      "use message_agent for revisions or close_agent when finished.",
     parameters: Type.Object({
       task: Type.String({
         description:
@@ -532,16 +552,38 @@ function setupParent(
             "already exist. Omit to share the current working tree.",
         }),
       ),
+      ...(modelOptions.length > 0
+        ? {
+            model: Type.Optional(
+              Type.Enum(
+                modelOptions.map((option) => option.tag),
+                {
+                  description:
+                    "Model profile for the subagent:\n" +
+                    modelOptions
+                      .map((option) => `- ${option.tag}: ${option.description}`)
+                      .join("\n") +
+                    "\nOmit to use the default profile, or pi's normal startup rules " +
+                    "if no default is configured.",
+                },
+              ),
+            ),
+          }
+        : {}),
     }),
     execute: async (_id, params, signal, _onUpdate, toolCtx) => {
-      const { task, branch } = params as { task: string; branch?: string };
+      const { task, branch, model } = params as {
+        task: string;
+        branch?: string;
+        model?: string;
+      };
       const id = randomUUID();
       const taskPath = taskPathFor(id);
       fs.writeFileSync(taskPath, task, { mode: 0o600 });
 
       let worktree: WorktreeInfo | undefined;
       try {
-        const config = loadConfig(toolCtx.cwd, toolCtx.isProjectTrusted());
+        const profile = resolveProfile(config, model);
         if (branch !== undefined) {
           worktree = await createWorktree(pi, toolCtx.cwd, id, branch, signal);
         }
@@ -551,7 +593,7 @@ function setupParent(
           id,
           taskPath,
           worktree?.path ?? toolCtx.cwd,
-          config,
+          profile,
           worktree?.branch,
         );
       } catch (err) {
@@ -583,10 +625,10 @@ function setupParent(
     label: "Message Agent",
     description:
       "Send a revision request or follow-up instruction to a live subagent. " +
-      "It receives your text as a new turn, acts on it, and reports again. " +
-      "Use after reviewing its report when changes are needed; use " +
-      "close_agent when the work is accepted. The next report arrives as a " +
-      "message in this session; do not poll or sleep.",
+      "The message steers its current run, or starts a new turn if it is idle. " +
+      "Use after reviewing its report when changes are needed. Its next report " +
+      "steers your current run, or starts a new turn if you are idle. Do not poll " +
+      "or sleep; continue other work or end your turn.",
     parameters: Type.Object({
       id: Type.String({
         description: "The subagent's UUID, from its spawn result or report.",
@@ -628,11 +670,10 @@ function setupParent(
     name: "close_agent",
     label: "Close Agent",
     description:
-      "Shut down a live subagent's session without spending a model turn. " +
-      "Use to accept its report or to stop one you no longer need. For an " +
-      "isolated agent, this removes its worktree but retains its agent/<name> " +
-      "branch for normal review, merge, or deletion. Subagents stay alive " +
-      "until closed; close every subagent when you are done with it.",
+      "Shut down a live subagent without spending a model turn. Use after " +
+      "accepting its report or when the subagent is no longer needed. For an " +
+      "isolated subagent, this removes its worktree and discards uncommitted " +
+      "changes, but retains its agent/<name> branch. Close every subagent when finished.",
     parameters: Type.Object({
       id: Type.String({
         description: "The subagent's UUID, from its spawn result or report.",

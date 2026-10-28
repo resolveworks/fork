@@ -33,7 +33,7 @@ Then restart pi, or `/reload`.
 
 The parent session gains three tools:
 
-- `spawn_agent({ task, branch? })` — writes the task to a file and opens a new tmux window running `pi @<taskfile>`. Returns immediately. The child sees the task plus normal project context, not the parent's conversation, so the task must be self-contained.
+- `spawn_agent({ task, branch?, model? })` — writes the task to a file and opens a new tmux window running `pi @<taskfile>`. Returns immediately. The child sees the task plus normal project context, not the parent's conversation, so the task must be self-contained.
 - `message_agent({ id, text })` — steers a revision request into the child's current run, or starts a new turn when the child is idle.
 - `close_agent({ id })` — mechanical shutdown; no model turn spent.
 
@@ -51,11 +51,28 @@ Fork deliberately does no environment setup and runs no checks. `git worktree ad
 
 ## Config
 
-`~/.pi/agent/fork.json`, overridden per-project by `.pi/fork.json` (read only in trusted projects). All fields optional; passed through to the child as CLI flags:
+`~/.pi/agent/fork.json`, overridden per-project by `.pi/fork.json` (read only in trusted projects). A `default` profile plus named `options`, passed through to the child as CLI flags:
 
 ```json
-{ "model": "glm-5.2", "provider": "zai", "thinking": "high" }
+{
+  "default": { "model": "glm-5.2", "thinking": "high" },
+  "options": [
+    {
+      "tag": "small",
+      "description": "Fast and inexpensive; use for routine tasks.",
+      "model": "glm-4.7-air"
+    },
+    {
+      "tag": "big",
+      "description": "Stronger reasoning; use for complex design and difficult debugging.",
+      "model": "claude-opus-4-5",
+      "provider": "anthropic"
+    }
+  ]
+}
 ```
+
+Each option requires a `description`, shown to the parent model alongside its tag so it can select an appropriate profile. `spawn_agent` takes an optional `model` argument naming an option's tag; without it, the `default` profile applies, or pi's normal startup rules if there is none. The project file replaces global fields wholesale.
 
 ## Runtime state
 
