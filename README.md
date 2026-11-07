@@ -37,7 +37,9 @@ The parent session gains three tools:
 - `message_agent({ id, text })` — steers a revision request into the child's current run, or starts a new turn when the child is idle.
 - `close_agent({ id })` — mechanical shutdown; no model turn spent.
 
-The child gains `report_result({ result })`. The report travels over a Unix socket and arrives in the parent as a steering notification: immediately if the parent is idle, or injected into the parent's current run after its pending tool calls. The child stays alive after reporting, awaiting the verdict: revisions via `message_agent`, or closure. Reports are outcomes, not progress updates. If delivery fails, the child is told unambiguously and retries with the same payload — a retry cannot double-deliver. Interrupting the parent would drop its queued notifications, so fork re-delivers them once the interrupted run settles — an escape can no longer lose a report.
+The child gains `message_parent({ message })`. The message travels over a Unix socket and arrives in the parent as a steering notification: immediately if the parent is idle, or injected into the parent's current run after its pending tool calls. The child stays alive after replying, awaiting the verdict: revisions via `message_agent`, or closure. Messages are outcomes, not progress updates. If delivery fails, the child is told unambiguously and retries with the same payload — a retry cannot double-deliver. Interrupting the parent would drop its queued notifications, so fork re-delivers them once the interrupted run settles — an escape can no longer lose a message.
+
+Input is tagged by sender: the task and every `message_agent` message reach the child wrapped in `<message-from-parent>`, while anything typed into the child's tmux window arrives unwrapped. The child's prompt uses that distinction to know who it is answering.
 
 Don't poll. Navigate windows with your usual tmux keys.
 

@@ -3,15 +3,15 @@
  *
  * The parent registers `spawn_agent`, `message_agent`, and `close_agent`
  * tools. Calling spawn_agent opens a new tmux window running pi with the
- * given task and returns immediately. The child reports results through `report_result`;
- * each report is delivered over a Unix socket as a notification that reaches
- * the parent promptly: if the parent is idle the report starts a turn at
- * once; if it is mid-run the report is steered into that run — delivered
- * after its current tool calls, before the next LLM call. An interrupt
- * clears the steering queue without delivering queued custom messages, so
- * reports are tracked until delivery is confirmed and re-delivered when an
- * interrupted run settles. The child stays alive after
- * reporting: the parent reviews the report, sends revision requests with
+ * given task and returns immediately. The child replies to the parent through
+ * `message_parent`; each message is delivered over a Unix socket as a
+ * notification that reaches the parent promptly: if the parent is idle the
+ * message starts a turn at once; if it is mid-run the message is steered into
+ * that run — delivered after its current tool calls, before the next LLM call.
+ * An interrupt clears the steering queue without delivering queued custom
+ * messages, so messages are tracked until delivery is confirmed and
+ * re-delivered when an interrupted run settles. The child stays alive after
+ * replying: the parent reviews the message, sends revision requests with
  * message_agent, and closes the child with close_agent.
  *
  * Configure subagent models via ~/.pi/agent/fork.json (global) or
@@ -579,7 +579,11 @@ function setupParent(pi: ExtensionAPI, ctx: ExtensionContext): void {
       };
       const id = randomUUID();
       const taskPath = taskPathFor(id);
-      fs.writeFileSync(taskPath, task, { mode: 0o600 });
+      // Tag the task like every other parent message, so the child learns one
+      // rule: tagged input is the parent, untagged input is a human at its window.
+      fs.writeFileSync(taskPath, `<message-from-parent>\n${task}\n</message-from-parent>`, {
+        mode: 0o600,
+      });
 
       let worktree: WorktreeInfo | undefined;
       try {
@@ -738,19 +742,14 @@ function subagentSystemPrompt(branch?: string): string {
     "conversation. Focus only on the delegated task. " +
     workspace +
     "\n\n" +
-    "# Reporting to the parent\n\n" +
-    "report_result is the only channel that reaches the parent. It cannot " +
-    "see your text replies, your tool output, or anything else in this " +
-    "session — so a turn that ends in plain text leaves the parent waiting " +
-    "forever, with no way to know you responded.\n\n" +
-    "- Call report_result when the task is done, when you have acted on a " +
-    "revision request from the parent, and when you are blocked and need " +
-    "the parent's input.\n" +
-    "- Every message from the parent calls for a report_result response, " +
-    "even if the report is only a brief status update.\n" +
-    "- After reporting, end your turn and wait. The session stays alive: " +
-    "the parent reviews each report and either sends you a revision request " +
-    "as an ordinary message or closes the session."
+    "# Communication\n\n" +
+    "- Parent messages, including your task, arrive in <message-from-parent> " +
+    "tags. Send answers, outcomes, and blockers back with message_parent; " +
+    "the parent cannot see your text replies.\n" +
+    "- Unwrapped messages come from the human using this session. Reply in " +
+    "text unless they ask you to relay something to the parent.\n\n" +
+    "After calling message_parent, end your turn and wait. The session stays " +
+    "alive for the parent's reply."
   );
 }
 
@@ -778,17 +777,14 @@ function processAgentLine(pi: ExtensionAPI, line: string): void {
     // steer: a revision request is news the child can fold into its current
     // run; it is delivered after the child's pending tool calls, before its
     // next LLM call.
-    // The tags and the trailing instruction matter: without an explicit cue
-    // to report back, a child may answer in plain text and end its turn,
-    // which never reaches the parent.
+    // Match the spawn task's wrapper. The reminder makes the child reply over
+    // the socket rather than ending with a text reply the parent cannot see.
     pi.sendMessage(
       {
         customType: MESSAGE_TYPE,
         content:
           `<message-from-parent>\n${candidate.text}\n</message-from-parent>\n\n` +
-          "Act on this message, then report the outcome with report_result. " +
-          "The parent receives only report_result output — it cannot see " +
-          "your text replies.",
+          "Act on this message, then reply with message_parent.",
         display: true,
       },
       { triggerTurn: true, deliverAs: "steer" },
@@ -811,37 +807,35 @@ function setupChild(
     };
   });
 
-  // ── result reporting (child → parent) ──────────────────────────────
+  // ── message channel (child → parent) ───────────────────────────────
   //
   // Delivery failures are reported to the model, which retries with the same
-  // result. Failures are unambiguous in practice: they mean the parent is
-  // gone or the write failed, so a retry cannot deliver a report twice.
-  let reportState: "open" | "sending" = "open";
+  // message. Failures are unambiguous in practice: they mean the parent is
+  // gone or the write failed, so a retry cannot deliver a message twice.
+  let sendState: "open" | "sending" = "open";
 
   pi.registerTool({
-    name: "report_result",
-    label: "Report Result",
+    name: "message_parent",
+    label: "Message Parent",
     description:
-      "Send a result report to the parent — the only channel that reaches " +
-      "it. The parent cannot see your text replies. Use when the task is " +
-      "done, when reporting a requested revision, or when you are " +
-      "blocked and need the parent's input. Report outcomes, not " +
-      "progress updates.",
+      "Send a message to the parent session; it cannot see your text replies. " +
+      "Use it to answer the parent, report completed work, or ask for input " +
+      "when blocked. Send outcomes, not progress updates.",
     parameters: Type.Object({
-      result: Type.String({
+      message: Type.String({
         description:
-          "The complete result for the parent. Include the outcome and, when " +
-          "relevant, edits, verification, and blockers.",
+          "The answer, outcome, or blocker for the parent. Include edits and " +
+          "verification when relevant.",
       }),
     }),
     execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
-      if (reportState !== "open") {
-        throw new Error("report_result is already delivering a report");
+      if (sendState !== "open") {
+        throw new Error("message_parent is already sending a message");
       }
-      reportState = "sending";
+      sendState = "sending";
 
-      const { result } = params as { result: string };
-      const payload = `${JSON.stringify({ id: subagentId, summary: result })}\n`;
+      const { message } = params as { message: string };
+      const payload = `${JSON.stringify({ id: subagentId, summary: message })}\n`;
 
       try {
         await new Promise<void>((resolve, reject) => {
@@ -864,25 +858,25 @@ function setupChild(
           socket.end(payload, () => finish());
         });
       } catch (err) {
-        reportState = "open";
-        const message = `fork: could not deliver result to parent: ${err}`;
-        console.error(message);
+        sendState = "open";
+        const failure = `fork: could not deliver message to parent: ${err}`;
+        console.error(failure);
         toolCtx.ui.notify(
-          `${message}. The report was not sent; retry report_result with the same result.`,
+          `${failure}. The message was not sent; retry message_parent with the same message.`,
           "error",
         );
         throw new Error(
-          "Result delivery failed; the report was not sent. Retry " +
-            "report_result with the same result.",
+          "Message delivery failed; the message was not sent. Retry " +
+            "message_parent with the same message.",
         );
       }
 
-      reportState = "open";
+      sendState = "open";
       return {
         content: [
           {
             type: "text" as const,
-            text: "Report delivered. End your turn and await the parent's verdict.",
+            text: "Delivered to the parent. End your turn and wait for its reply.",
           },
         ],
         details: {},
