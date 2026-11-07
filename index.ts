@@ -80,6 +80,9 @@ const BRANCH_PREFIX = "agent/";
 const BRANCH_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const RESULT_TYPE = "fork-result";
 const MESSAGE_TYPE = "fork-message";
+const PARENT_REQUEST_REMINDER =
+  "Act on this request. It remains open until you submit the complete response " +
+  "with message_parent before going idle.";
 
 /** Number of markdown lines shown when the message row is collapsed (ctrl+o to expand). */
 const PREVIEW_LINES = 10;
@@ -581,9 +584,11 @@ function setupParent(pi: ExtensionAPI, ctx: ExtensionContext): void {
       const taskPath = taskPathFor(id);
       // Tag the task like every other parent message, so the child learns one
       // rule: tagged input is the parent, untagged input is a human at its window.
-      fs.writeFileSync(taskPath, `<message-from-parent>\n${task}\n</message-from-parent>`, {
-        mode: 0o600,
-      });
+      fs.writeFileSync(
+        taskPath,
+        `<message-from-parent>\n${task}\n</message-from-parent>\n\n${PARENT_REQUEST_REMINDER}`,
+        { mode: 0o600 },
+      );
 
       let worktree: WorktreeInfo | undefined;
       try {
@@ -742,14 +747,18 @@ function subagentSystemPrompt(branch?: string): string {
     "conversation. Focus only on the delegated task. " +
     workspace +
     "\n\n" +
-    "# Communication\n\n" +
-    "- Parent messages, including your task, arrive in <message-from-parent> " +
-    "tags. Send answers, outcomes, and blockers back with message_parent; " +
-    "the parent cannot see your text replies.\n" +
-    "- Unwrapped messages come from the human using this session. Reply in " +
-    "text unless they ask you to relay something to the parent.\n\n" +
-    "After calling message_parent, end your turn and wait. The session stays " +
-    "alive for the parent's reply."
+    "# Delegated work\n\n" +
+    "Parent requests, including your initial task, arrive in " +
+    "<message-from-parent> tags. A request remains open until you call " +
+    "message_parent with its complete response. Call it with the outcome when " +
+    "finished, the answer to a parent question, or a blocker requiring parent " +
+    "input. Ordinary assistant text does not reach the parent.\n\n" +
+    "After submitting, wait for the parent's next request. The session remains " +
+    "open for revisions.\n\n" +
+    "# Direct human interaction\n\n" +
+    "Untagged messages come from the human using this session. Answer them in " +
+    "text unless they ask you to relay something to the parent. These exchanges " +
+    "do not complete or replace an open parent request."
   );
 }
 
@@ -784,7 +793,7 @@ function processAgentLine(pi: ExtensionAPI, line: string): void {
         customType: MESSAGE_TYPE,
         content:
           `<message-from-parent>\n${candidate.text}\n</message-from-parent>\n\n` +
-          "Act on this message, then reply with message_parent.",
+          PARENT_REQUEST_REMINDER,
         display: true,
       },
       { triggerTurn: true, deliverAs: "steer" },
@@ -818,14 +827,16 @@ function setupChild(
     name: "message_parent",
     label: "Message Parent",
     description:
-      "Send a message to the parent session; it cannot see your text replies. " +
-      "Use it to answer the parent, report completed work, or ask for input " +
-      "when blocked. Send outcomes, not progress updates.",
+      "Submit a complete response to the parent session. Use it for completed " +
+      "work, answers to parent requests, or blockers requiring input. The parent " +
+      "receives only this tool's message, not ordinary assistant text. Send " +
+      "outcomes, not progress updates.",
     parameters: Type.Object({
       message: Type.String({
         description:
-          "The answer, outcome, or blocker for the parent. Include edits and " +
-          "verification when relevant.",
+          "The full response for the parent, including the requested deliverable " +
+          "and relevant edits, verification, or blocker—not merely a notification " +
+          "that work is done.",
       }),
     }),
     execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
@@ -876,7 +887,7 @@ function setupChild(
         content: [
           {
             type: "text" as const,
-            text: "Delivered to the parent. End your turn and wait for its reply.",
+            text: "Submitted to the parent. End your turn and wait for its next request.",
           },
         ],
         details: {},
