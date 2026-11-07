@@ -95,7 +95,3 @@ pnpm format:check
 ```
 
 Use `pnpm format` to apply formatting.
-
-## License
-
-MIT
