@@ -3,11 +3,12 @@
  *
  * The parent registers `spawn_agent`, `message_agent`, and `close_agent`
  * tools. Calling spawn_agent opens a new tmux window running pi with the
- * given task and returns immediately. The child replies to the parent through
- * `message_parent`; each message is delivered over a Unix socket as a
- * notification that reaches the parent promptly: if the parent is idle the
- * message starts a turn at once; if it is mid-run the message is steered into
- * that run — delivered after its current tool calls, before the next LLM call.
+ * given task and returns immediately. Whenever the child settles, its final
+ * response and any human messages since the previous settle are delivered over
+ * a Unix socket as a notification that reaches the parent promptly: if the
+ * parent is idle the message starts a turn at once; if it is mid-run the
+ * message is steered into that run — delivered after its current tool calls,
+ * before the next LLM call.
  * An interrupt clears the steering queue without delivering queued custom
  * messages, so messages are tracked until delivery is confirmed and
  * re-delivered when an interrupted run settles. The child stays alive after
@@ -80,9 +81,6 @@ const BRANCH_PREFIX = "agent/";
 const BRANCH_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const RESULT_TYPE = "fork-result";
 const MESSAGE_TYPE = "fork-message";
-const PARENT_REQUEST_REMINDER =
-  "Act on this request. It remains open until you submit the complete response " +
-  "with message_parent before going idle.";
 
 /** Number of markdown lines shown when the message row is collapsed (ctrl+o to expand). */
 const PREVIEW_LINES = 10;
@@ -390,6 +388,27 @@ function sendToAgent(id: string, message: AgentMessage): Promise<void> {
   });
 }
 
+function sendResult(socketPath: string, result: ResultPayload): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const socket = net.connect(socketPath);
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (err) {
+        socket.destroy();
+        reject(err);
+      } else {
+        resolve();
+      }
+    };
+    socket.setTimeout(5000);
+    socket.once("error", (err) => finish(err));
+    socket.once("timeout", () => finish(new Error("timed out after 5 seconds")));
+    socket.end(`${JSON.stringify(result)}\n`, () => finish());
+  });
+}
+
 // ── result delivery ─────────────────────────────────────────────────
 
 /** Deliver one report as a fork-result message, tracked in `undelivered`.
@@ -416,7 +435,7 @@ function deliverResult(
   pi.sendMessage(
     {
       customType: RESULT_TYPE,
-      content: `Subagent ${payload.id} reported:\n\n${summary}`,
+      content: `Subagent ${payload.id} settled:\n\n${summary}`,
       display: true,
       details: { nonce },
     },
@@ -582,13 +601,7 @@ function setupParent(pi: ExtensionAPI, ctx: ExtensionContext): void {
       };
       const id = randomUUID();
       const taskPath = taskPathFor(id);
-      // Tag the task like every other parent message, so the child learns one
-      // rule: tagged input is the parent, untagged input is a human at its window.
-      fs.writeFileSync(
-        taskPath,
-        `<message-from-parent>\n${task}\n</message-from-parent>\n\n${PARENT_REQUEST_REMINDER}`,
-        { mode: 0o600 },
-      );
+      fs.writeFileSync(taskPath, task, { mode: 0o600 });
 
       let worktree: WorktreeInfo | undefined;
       try {
@@ -735,7 +748,7 @@ function setupParent(pi: ExtensionAPI, ctx: ExtensionContext): void {
 function subagentSystemPrompt(branch?: string): string {
   const workspace = branch
     ? `You work in an isolated Git worktree on branch ${branch}. Commit all ` +
-      "work before reporting so the parent can review and merge the branch; " +
+      "work before finishing so the parent can review and merge the branch; " +
       "repository commit hooks provide its validation."
     : "You share the parent's working tree, so your edits are immediately " +
       "visible to the parent.";
@@ -745,20 +758,7 @@ function subagentSystemPrompt(branch?: string): string {
     "You are a subagent executing one task delegated by a parent pi session. " +
     "You see the task and pi's normal project context, but not the parent's " +
     "conversation. Focus only on the delegated task. " +
-    workspace +
-    "\n\n" +
-    "# Delegated work\n\n" +
-    "Parent requests, including your initial task, arrive in " +
-    "<message-from-parent> tags. A request remains open until you call " +
-    "message_parent with its complete response. Call it with the outcome when " +
-    "finished, the answer to a parent question, or a blocker requiring parent " +
-    "input. Ordinary assistant text does not reach the parent.\n\n" +
-    "After submitting, wait for the parent's next request. The session remains " +
-    "open for revisions.\n\n" +
-    "# Direct human interaction\n\n" +
-    "Untagged messages come from the human using this session. Answer them in " +
-    "text unless they ask you to relay something to the parent. These exchanges " +
-    "do not complete or replace an open parent request."
+    workspace
   );
 }
 
@@ -786,14 +786,10 @@ function processAgentLine(pi: ExtensionAPI, line: string): void {
     // steer: a revision request is news the child can fold into its current
     // run; it is delivered after the child's pending tool calls, before its
     // next LLM call.
-    // Match the spawn task's wrapper. The reminder makes the child reply over
-    // the socket rather than ending with a text reply the parent cannot see.
     pi.sendMessage(
       {
         customType: MESSAGE_TYPE,
-        content:
-          `<message-from-parent>\n${candidate.text}\n</message-from-parent>\n\n` +
-          PARENT_REQUEST_REMINDER,
+        content: candidate.text,
         display: true,
       },
       { triggerTurn: true, deliverAs: "steer" },
@@ -810,89 +806,70 @@ function setupChild(
   subagentId: string,
   branch?: string,
 ): void {
-  pi.on("before_agent_start", (event) => {
+  // The initial task precedes the first run and is already known to the
+  // parent. Later user entries are human input to include at the next settle.
+  let settledEntryCount: number | undefined;
+  let pendingResult: string | null = null;
+
+  pi.on("before_agent_start", (event, ctx) => {
+    settledEntryCount ??= ctx.sessionManager.getEntries().length;
     return {
       systemPrompt: `${event.systemPrompt}\n\n${subagentSystemPrompt(branch)}`,
     };
   });
 
-  // ── message channel (child → parent) ───────────────────────────────
-  //
-  // Delivery failures are reported to the model, which retries with the same
-  // message. Failures are unambiguous in practice: they mean the parent is
-  // gone or the write failed, so a retry cannot deliver a message twice.
-  let sendState: "open" | "sending" = "open";
+  // agent_end may be followed by retries, compaction, or queued work. Capture
+  // its clean final response here, but deliver only once the session settles.
+  pi.on("agent_end", (event) => {
+    const last = [...event.messages].reverse().find((message) => message.role === "assistant");
+    if (last?.role !== "assistant" || last.stopReason !== "stop") {
+      pendingResult = null;
+      return;
+    }
+    pendingResult = last.content
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("\n");
+  });
 
-  pi.registerTool({
-    name: "message_parent",
-    label: "Message Parent",
-    description:
-      "Submit a complete response to the parent session. Use it for completed " +
-      "work, answers to parent requests, or blockers requiring input. The parent " +
-      "receives only this tool's message, not ordinary assistant text. Send " +
-      "outcomes, not progress updates.",
-    parameters: Type.Object({
-      message: Type.String({
-        description:
-          "The full response for the parent, including the requested deliverable " +
-          "and relevant edits, verification, or blocker—not merely a notification " +
-          "that work is done.",
-      }),
-    }),
-    execute: async (_id, params, _signal, _onUpdate, toolCtx) => {
-      if (sendState !== "open") {
-        throw new Error("message_parent is already sending a message");
-      }
-      sendState = "sending";
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (settledEntryCount === undefined) return;
 
-      const { message } = params as { message: string };
-      const payload = `${JSON.stringify({ id: subagentId, summary: message })}\n`;
+    const entries = ctx.sessionManager.getEntries();
+    const humanMessages = entries.slice(settledEntryCount).flatMap((entry) => {
+      if (entry.type !== "message" || entry.message.role !== "user") return [];
+      const content = entry.message.content;
+      const text =
+        typeof content === "string"
+          ? content
+          : content
+              .filter((part) => part.type === "text")
+              .map((part) => part.text)
+              .join("\n");
+      return text.trim() ? [text] : [];
+    });
 
-      try {
-        await new Promise<void>((resolve, reject) => {
-          let settled = false;
-          const socket = net.connect(socketPath);
-          const finish = (err?: Error) => {
-            if (settled) return;
-            settled = true;
-            if (err) {
-              socket.destroy();
-              reject(err);
-            } else {
-              resolve();
-            }
-          };
+    const sections: string[] = [];
+    if (humanMessages.length > 0) {
+      sections.push(humanMessages.map((text) => `Human in child session:\n${text}`).join("\n\n"));
+    }
+    if (pendingResult?.trim()) sections.push(`Final response:\n\n${pendingResult}`);
 
-          socket.setTimeout(5000);
-          socket.once("error", (err) => finish(err));
-          socket.once("timeout", () => finish(new Error("timed out after 5 seconds")));
-          socket.end(payload, () => finish());
-        });
-      } catch (err) {
-        sendState = "open";
-        const failure = `fork: could not deliver message to parent: ${err}`;
-        console.error(failure);
-        toolCtx.ui.notify(
-          `${failure}. The message was not sent; retry message_parent with the same message.`,
-          "error",
-        );
-        throw new Error(
-          "Message delivery failed; the message was not sent. Retry " +
-            "message_parent with the same message.",
-        );
-      }
+    if (sections.length === 0) {
+      settledEntryCount = entries.length;
+      pendingResult = null;
+      return;
+    }
 
-      sendState = "open";
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: "Submitted to the parent. End your turn and wait for its next request.",
-          },
-        ],
-        details: {},
-      };
-    },
+    try {
+      await sendResult(socketPath, { id: subagentId, summary: sections.join("\n\n") });
+      settledEntryCount = entries.length;
+      pendingResult = null;
+    } catch (err) {
+      const failure = `fork: could not deliver settlement to parent: ${err}`;
+      console.error(failure);
+      ctx.ui.notify(failure, "error");
+    }
   });
 
   // ── verdict channel (parent → child) ─────────────────────────────────
