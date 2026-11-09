@@ -40,6 +40,7 @@ import {
   getAgentDir,
   getMarkdownTheme,
   keyHint,
+  type MessageEndEvent,
   type MessageRenderer,
 } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
@@ -806,9 +807,12 @@ function setupChild(
   subagentId: string,
   branch?: string,
 ): void {
-  // The initial task precedes the first run and is already known to the
-  // parent. Later user entries are human input to include at the next settle.
+  // pi emits before_agent_start before it persists the starting user message,
+  // so the first settlement window contains the delegated task. Keep a
+  // reference to that message and exclude its entry: later user entries are
+  // human input.
   let settledEntryCount: number | undefined;
+  let initialTaskMessage: MessageEndEvent["message"] | undefined;
   let pendingResult: string | null = null;
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -816,6 +820,12 @@ function setupChild(
     return {
       systemPrompt: `${event.systemPrompt}\n\n${subagentSystemPrompt(branch)}`,
     };
+  });
+
+  pi.on("message_end", (event) => {
+    if (initialTaskMessage === undefined && event.message.role === "user") {
+      initialTaskMessage = event.message;
+    }
   });
 
   // agent_end may be followed by retries, compaction, or queued work. Capture
@@ -832,8 +842,11 @@ function setupChild(
       .join("\n");
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_settled", async (event, ctx) => {
     if (settledEntryCount === undefined) return;
+    // An aborted run is not a report to the parent. Leave the cursor and
+    // pending result alone so the next real settlement carries the window.
+    if (event.aborted) return;
 
     const entries = ctx.sessionManager.getEntries();
     const humanMessages = entries.slice(settledEntryCount).flatMap((entry) => {
@@ -846,7 +859,8 @@ function setupChild(
               .filter((part) => part.type === "text")
               .map((part) => part.text)
               .join("\n");
-      return text.trim() ? [text] : [];
+      if (!text.trim() || entry.message === initialTaskMessage) return [];
+      return [text];
     });
 
     const sections: string[] = [];

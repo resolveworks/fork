@@ -4,7 +4,7 @@ Spawn [pi](https://github.com/earendil-works/pi) subagents in tmux windows. Each
 
 ## Requirements
 
-- pi 0.80.4 or newer (newest pi API used: `agent_settled`)
+- pi 1.1.0 or newer (newest pi API used: `agent_settled.aborted`)
 - tmux, with pi running inside it
 - git, for `branch` worktree isolation
 - Linux; macOS untested (nothing Linux-specific), Windows unsupported
