@@ -1,21 +1,25 @@
 # fork
 
-Spawn [pi](https://github.com/earendil-works/pi) subagents in tmux windows. Each child is a separate pi process you can watch and type into; it reports back over a Unix socket and stays alive for revision requests. Assumes fluency with pi, tmux, and git worktrees, and stays out of the way — including silently doing nothing outside tmux.
+Spawn [pi](https://github.com/earendil-works/pi) subagents as separate interactive pi sessions in tmux windows. Each child has its own conversation context and normal pi capabilities. Watch or type into its window; fork automatically delivers its response when it settles. Children stay alive for revision requests until closed.
+
+Fork adds three tools to the parent session. Tmux provides window management, Unix sockets carry reports and follow-up instructions, and optional Git worktrees isolate changes.
 
 ## Requirements
 
-- pi 1.1.0 or newer (newest pi API used: `agent_settled.aborted`)
+- pi 1.1.0 or newer
 - tmux, with pi running inside it
-- git, for `worktree` isolation
-- Linux; macOS untested (nothing Linux-specific), Windows unsupported
+- Git, for optional worktree isolation
+- Linux; macOS is untested, though the implementation uses portable tmux, Git, and Unix socket APIs
 
 ## Install
+
+From npm:
 
 ```bash
 pi install npm:@resolveworks/fork
 ```
 
-Or from git:
+From Git:
 
 ```bash
 pi install git:github.com/resolveworks/fork
@@ -27,37 +31,78 @@ Or once, without installing:
 pi -e npm:@resolveworks/fork
 ```
 
-Then restart pi, or `/reload`.
+Restart pi or run `/reload` after installation.
 
-## What you get
+## Usage
+
+Start pi inside tmux and ask it to delegate a self-contained task. For example:
+
+> Spawn a subagent named `docs-review` to check README.md against index.ts. Review only and report inaccuracies and missing behavior with file and line references.
+
+Fork opens a background tmux window named `docs-review` and returns immediately. Continue other work or end your turn; settlement reports arrive automatically.
+
+Use your normal tmux keys to inspect the child or type into its session. When the child settles, its response and any messages you entered since its previous settlement arrive in the parent.
+
+Review the report, then request revisions or close the child:
+
+> Ask the documentation subagent to also check the configuration examples.
+
+> Close the documentation subagent; its report is sufficient.
+
+Children retain their full session context between revision requests.
+
+## Tools
 
 The parent session gains three tools:
 
-- `spawn_agent({ task, name, worktree?, model? })` — writes the task to a file and opens a new tmux window titled `<name>` running `pi @<taskfile>`. Returns immediately. The child sees the task plus normal project context, not the parent's conversation, so the task must be self-contained.
-- `message_agent({ id, text })` — steers a revision request into the child's current run, or starts a new turn when the child is idle.
-- `close_agent({ id })` — mechanical shutdown; no model turn spent.
+- `spawn_agent({ name, task, worktree?, model? })` — starts a child in a new tmux window and returns its UUID immediately.
+  - `name` is lowercase kebab-case. It names the tmux window and, with isolation enabled, the Git branch.
+  - `task` is passed verbatim as the child’s initial prompt. The child receives this task and pi’s normal project context. Include the goal, conversation-specific context, constraints, relevant paths, and expected output.
+  - `worktree` creates an isolated Git worktree when `true`; the default is `false`.
+  - `model` selects a configured [model profile](#model-profiles).
+- `message_agent({ id, text })` — sends a revision request or follow-up instruction to an open child. The message steers its current run or starts a new turn if the child is idle.
+- `close_agent({ id })` — closes the child and cleans up its runtime state without spending a model turn.
 
-Whenever the child settles, fork sends its final response and any human messages entered since the previous settle over a Unix socket. No reporting tool or model action is required. The settlement arrives in the parent as a steering notification: immediately if the parent is idle, or injected into the parent's current run after its pending tool calls. Human interventions therefore arrive together with the child's response, preserving their context.
+Names label tmux windows and Git branches; UUIDs identify agents in `message_agent` and `close_agent`.
 
-The child stays alive after settling, awaiting revisions via `message_agent` or closure. Delivery failures are reported in the child session. Interrupting the parent would drop its queued notifications, so fork re-delivers them once the interrupted run settles — an escape can no longer lose a message.
+## Settlement reports
 
-Don't poll. Navigate windows with your usual tmux keys.
+Whenever a child settles after a completed run, fork sends its clean final response and any human messages entered in the child session since the previous settlement.
 
-## Isolation
+The report arrives as a steering notification. If the parent is busy, it is delivered after pending tool calls and before the next model call; if the parent is idle, it starts a new turn immediately.
 
-Without `worktree: true`, the child shares the parent's working tree — fine for read-only or sequential work, a bad idea for concurrent editors.
+Fork tracks each report until delivery is confirmed. When a parent interrupt clears queued reports, fork delivers them again once the interrupted run settles. Delivery failures on the child side appear in the child session.
 
-With `worktree: true`, fork runs `git worktree add ~/.pi/worktrees/<uuid> -b agent/<name> HEAD` and spawns the child there. The spawn fails if that branch already exists. The child commits its work; `close_agent` force-removes the worktree (uncommitted work dies with it) and retains the branch for normal review and merge.
+Long reports are collapsed in the parent transcript. Use pi’s expand keybinding (`ctrl+o` by default) to read the full report.
 
-Fork deliberately does no environment setup and runs no checks. `git worktree add` fires the repo's `post-checkout` hook — put pnpm/uv/whatever setup there. Commit hooks validate.
+## Working-tree isolation
 
-## Config
+By default, the child shares the parent’s working tree. Use shared mode for read-only or sequential work and worktree isolation for concurrent editors.
 
-`~/.pi/agent/fork.json`, overridden per-project by `.pi/fork.json` (read only in trusted projects). A `default` profile plus named `options`, passed through to the child as CLI flags:
+With `worktree: true`, fork creates a worktree from `HEAD`:
+
+```bash
+git worktree add -b agent/<name> ~/.pi/worktrees/<uuid> HEAD
+```
+
+The child starts in that worktree and is instructed to commit its work before finishing. Spawning fails if `agent/<name>` already exists.
+
+`close_agent` kills the child’s tmux window, force-removes the worktree, and deletes its task file. **Uncommitted work in the worktree is discarded.** The `agent/<name>` branch is retained for ordinary review and merge.
+
+Children run with the permissions of the user who launched pi.
+
+Repository hooks manage environment setup and validation: Git’s `post-checkout` hook can prepare the worktree and install dependencies, while commit hooks validate committed work.
+
+## Model profiles
+
+Configure child models globally in `~/.pi/agent/fork.json` or per project in `.pi/fork.json`. Project configuration is read in trusted projects.
 
 ```json
 {
-  "default": { "model": "glm-5.2", "thinking": "high" },
+  "default": {
+    "model": "glm-5.2",
+    "thinking": "high"
+  },
   "options": [
     {
       "tag": "small",
@@ -74,24 +119,34 @@ Fork deliberately does no environment setup and runs no checks. `git worktree ad
 }
 ```
 
-Each option requires a `description`, shown to the parent model alongside its tag so it can select an appropriate profile. `spawn_agent` takes an optional `model` argument naming an option's tag; without it, the `default` profile applies, or pi's normal startup rules if there is none. The project file replaces global fields wholesale.
+Profiles support `model`, `provider`, and `thinking`. Fork passes them to the child as pi CLI flags, leaving model resolution to pi.
+
+Each option requires a `tag` and `description`. Fork exposes these to the parent model, which can select a profile with `spawn_agent`’s `model` argument. `default` applies when that argument is omitted; an omitted default uses pi’s normal startup rules.
+
+Configuration is merged by top-level field: project values replace global values.
 
 ## Runtime state
 
-Under `~/.pi/agent/extensions/fork/` (sockets and task files are mode `0o600`):
+Fork stores runtime state under `~/.pi/agent/extensions/fork/`:
 
 - `sockets/<parent-session-id>.sock` — result channel, child → parent
-- `agents/<uuid>.sock` — verdict channel, parent → child
-- `tasks/<uuid>.md` — the task handed to the child; a present task file marks an open agent and is authoritative across extension reloads
+- `agents/<uuid>.sock` — message channel, parent → child
+- `tasks/<uuid>.md` — the child’s initial task; a present task file marks the agent as open and remains authoritative across extension reloads
+
+Sockets and task files use mode `0o600`. Isolated worktrees live under `~/.pi/worktrees/<uuid>`.
 
 ## Development
 
-Requires Node.js 22.18 or newer and pnpm 11.3.0.
+Requires Node.js 22.18 or newer and pnpm 11.3.0 or newer.
 
-```sh
+```bash
 pnpm install --frozen-lockfile
 pnpm typecheck
 pnpm format:check
 ```
 
-Use `pnpm format` to apply formatting.
+Use `pnpm format` to apply formatting. The pre-commit hook enforces type checking and formatting.
+
+## License
+
+[MIT](LICENSE)
