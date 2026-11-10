@@ -1,6 +1,6 @@
 {
   "name": "@resolveworks/fork",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Subagents for Pi — spawn pi sessions in tmux windows with task delegation and revision loops",
   "license": "MIT",
   "type": "module",
@@ -9,7 +9,8 @@
     "node": ">=22.18.0"
   },
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi-extension"
   ],
   "files": [
     "index.ts"
