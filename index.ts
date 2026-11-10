@@ -79,7 +79,8 @@ const AGENTS_DIR = path.join(ROOT, "agents");
 const TASKS_DIR = path.join(ROOT, "tasks");
 const WORKTREES_DIR = path.join(PI_DIR, "worktrees");
 const BRANCH_PREFIX = "agent/";
-const BRANCH_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const AGENT_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const AGENT_ID_OPTION = "@fork-agent-id";
 const RESULT_TYPE = "fork-result";
 const MESSAGE_TYPE = "fork-message";
 
@@ -256,15 +257,12 @@ async function createWorktree(
   pi: ExtensionAPI,
   cwd: string,
   id: string,
-  branchName: string,
+  name: string,
   signal?: AbortSignal,
 ): Promise<WorktreeInfo> {
-  if (!BRANCH_NAME.test(branchName)) {
-    throw new Error("fork: branch names must use lowercase letters, numbers, and single dashes");
-  }
-  const branch = `${BRANCH_PREFIX}${branchName}`;
+  const branch = `${BRANCH_PREFIX}${name}`;
 
-  // An explicit branch outside Git fails rather than degrading to shared mode.
+  // A requested worktree outside Git fails rather than degrading to shared mode.
   await git(pi, ["rev-parse", "--show-toplevel"], cwd, signal);
   fs.mkdirSync(WORKTREES_DIR, { recursive: true });
   const info = { path: worktreePathFor(id), branch, repoCwd: cwd };
@@ -287,6 +285,7 @@ function spawn(
   session: string,
   sessionId: string,
   id: string,
+  name: string,
   taskPath: string,
   cwd: string,
   profile: ModelProfile,
@@ -301,7 +300,34 @@ function spawn(
   if (branch) cmdArgs.push("--subagent-branch", branch);
   cmdArgs.push(`@${taskPath}`);
 
-  tmuxSync(["new-window", "-d", "-t", `${session}:`, "-n", id, "-c", cwd, ...cmdArgs]);
+  const windowId = tmuxSync([
+    "new-window",
+    "-d",
+    "-P",
+    "-F",
+    "#{window_id}",
+    "-t",
+    `${session}:`,
+    "-n",
+    name,
+    "-c",
+    cwd,
+    ...cmdArgs,
+  ]).trim();
+
+  // The title is only a label; the UUID remains the window's fork identity.
+  tmuxSync(["set-window-option", "-t", windowId, AGENT_ID_OPTION, id]);
+}
+
+function killAgentWindow(session: string, id: string): boolean {
+  const windows = tmuxSync(["list-windows", "-t", session, "-F", "#{window_id} #{@fork-agent-id}"]);
+  for (const line of windows.split("\n")) {
+    const [windowId, agentId] = line.split(" ");
+    if (agentId !== id) continue;
+    tmuxSync(["kill-window", "-t", windowId]);
+    return true;
+  }
+  return false;
 }
 
 // ── line servers and socket writes ──────────────────────────────────
@@ -549,7 +575,7 @@ function setupParent(pi: ExtensionAPI, ctx: ExtensionContext): void {
       "tmux window. Use this for independent work that benefits from isolated " +
       "context; handle simple, sequential, or context-dependent work yourself. " +
       "By default, the subagent shares your working tree; do not run concurrent " +
-      "editing agents in shared mode. Set branch to use an isolated Git worktree. " +
+      "editing agents in shared mode. Set worktree to true for an isolated Git worktree. " +
       "The subagent sees the task and normal project context, but not this " +
       "conversation, so include all necessary context in the task. This tool " +
       "returns immediately. The subagent's report steers your current run, or " +
@@ -557,6 +583,12 @@ function setupParent(pi: ExtensionAPI, ctx: ExtensionContext): void {
       "work or end your turn. After the report arrives, review its work, then " +
       "use message_agent for revisions or close_agent when finished.",
     parameters: Type.Object({
+      name: Type.String({
+        pattern: AGENT_NAME.source,
+        description:
+          "Lowercase kebab-case subagent name used as the tmux window title and, " +
+          "with worktree enabled, as agent/<name> for the new branch.",
+      }),
       task: Type.String({
         description:
           "Self-contained instructions passed verbatim as the subagent's initial " +
@@ -565,14 +597,12 @@ function setupParent(pi: ExtensionAPI, ctx: ExtensionContext): void {
           "the expected output. Do not reference context it cannot see or repeat " +
           "project instructions from AGENTS.md.",
       }),
-      branch: Type.Optional(
-        Type.String({
-          pattern: BRANCH_NAME.source,
+      worktree: Type.Optional(
+        Type.Boolean({
           description:
-            "Lowercase kebab-case name for a new isolated-worktree branch, " +
-            "without the agent/ prefix (for example, issue-4-worktree-isolation). " +
-            "Fork creates the exact branch agent/<name> from HEAD; it must not " +
-            "already exist. Omit to share the current working tree.",
+            "Create an isolated Git worktree on a new agent/<name> branch from HEAD. " +
+            "The branch must not already exist. Omit or set false to share the current " +
+            "working tree.",
         }),
       ),
       ...(modelOptions.length > 0
@@ -595,9 +625,15 @@ function setupParent(pi: ExtensionAPI, ctx: ExtensionContext): void {
         : {}),
     }),
     execute: async (_id, params, signal, _onUpdate, toolCtx) => {
-      const { task, branch, model } = params as {
+      const {
+        task,
+        name,
+        worktree: useWorktree,
+        model,
+      } = params as {
         task: string;
-        branch?: string;
+        name: string;
+        worktree?: boolean;
         model?: string;
       };
       const id = randomUUID();
@@ -607,13 +643,14 @@ function setupParent(pi: ExtensionAPI, ctx: ExtensionContext): void {
       let worktree: WorktreeInfo | undefined;
       try {
         const profile = resolveProfile(config, model);
-        if (branch !== undefined) {
-          worktree = await createWorktree(pi, toolCtx.cwd, id, branch, signal);
+        if (useWorktree) {
+          worktree = await createWorktree(pi, toolCtx.cwd, id, name, signal);
         }
         spawn(
           session,
           sessionId,
           id,
+          name,
           taskPath,
           worktree?.path ?? toolCtx.cwd,
           profile,
@@ -711,12 +748,13 @@ function setupParent(pi: ExtensionAPI, ctx: ExtensionContext): void {
       // Kill the window first: SIGHUP reaches the whole process group, so
       // in-flight tool subprocesses die with the session, and pi's signal
       // path runs session_shutdown teardown without waiting for a busy
-      // session to settle. A failure means the window is already gone;
-      // cleanup proceeds either way.
+      // session to settle. A missing window or a gone session means there is
+      // nothing to kill; cleanup proceeds either way.
+      let windowClosed = false;
       try {
-        tmuxSync(["kill-window", "-t", `${session}:=${id}`]);
+        windowClosed = killAgentWindow(session, id);
       } catch {
-        // Window already closed, renamed, or session gone — nothing to kill.
+        // Session gone — nothing to kill.
       }
 
       let cleanupWarning = "";
@@ -731,11 +769,14 @@ function setupParent(pi: ExtensionAPI, ctx: ExtensionContext): void {
 
       safeUnlink(taskPathFor(id), `task file for ${id}`);
       const retained = hasWorktree ? " Its branch was retained." : "";
+      const windowNote = windowClosed
+        ? "killed its tmux window"
+        : "its tmux window was already gone";
       return {
         content: [
           {
             type: "text" as const,
-            text: `Closed subagent ${id}; killed its tmux window.${retained}${cleanupWarning}`,
+            text: `Closed subagent ${id}; ${windowNote}.${retained}${cleanupWarning}`,
           },
         ],
         details: {},

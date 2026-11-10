@@ -6,7 +6,7 @@ Spawn [pi](https://github.com/earendil-works/pi) subagents in tmux windows. Each
 
 - pi 1.1.0 or newer (newest pi API used: `agent_settled.aborted`)
 - tmux, with pi running inside it
-- git, for `branch` worktree isolation
+- git, for `worktree` isolation
 - Linux; macOS untested (nothing Linux-specific), Windows unsupported
 
 ## Install
@@ -33,7 +33,7 @@ Then restart pi, or `/reload`.
 
 The parent session gains three tools:
 
-- `spawn_agent({ task, branch?, model? })` — writes the task to a file and opens a new tmux window running `pi @<taskfile>`. Returns immediately. The child sees the task plus normal project context, not the parent's conversation, so the task must be self-contained.
+- `spawn_agent({ task, name, worktree?, model? })` — writes the task to a file and opens a new tmux window titled `<name>` running `pi @<taskfile>`. Returns immediately. The child sees the task plus normal project context, not the parent's conversation, so the task must be self-contained.
 - `message_agent({ id, text })` — steers a revision request into the child's current run, or starts a new turn when the child is idle.
 - `close_agent({ id })` — mechanical shutdown; no model turn spent.
 
@@ -45,9 +45,9 @@ Don't poll. Navigate windows with your usual tmux keys.
 
 ## Isolation
 
-Without `branch`, the child shares the parent's working tree — fine for read-only or sequential work, a bad idea for concurrent editors.
+Without `worktree: true`, the child shares the parent's working tree — fine for read-only or sequential work, a bad idea for concurrent editors.
 
-With `branch: "kebab-name"`, fork runs `git worktree add ~/.pi/worktrees/<uuid> -b agent/<kebab-name> HEAD` and spawns the child there. The child commits its work; `close_agent` force-removes the worktree (uncommitted work dies with it) and retains the branch for normal review and merge.
+With `worktree: true`, fork runs `git worktree add ~/.pi/worktrees/<uuid> -b agent/<name> HEAD` and spawns the child there. The spawn fails if that branch already exists. The child commits its work; `close_agent` force-removes the worktree (uncommitted work dies with it) and retains the branch for normal review and merge.
 
 Fork deliberately does no environment setup and runs no checks. `git worktree add` fires the repo's `post-checkout` hook — put pnpm/uv/whatever setup there. Commit hooks validate.
 
